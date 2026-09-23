@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """固定输入的离线演示：真实运行 borrow_check。
 
-三部分（全部现场计算，无 sleep、无预录结果）：
-
+v1 部分（lifecycle=False，默认）：
 1. 正常结果：互不相交字段的独立借用，经分支/循环后干净通过；
 2. 实际拒绝：循环中未结束的借用，打印带前驱传播链的冲突来源；
 3. 异常边界：可定位的非法输入错误，以及“预算耗尽 != 证明无冲突”。
 
-运行：python demo.py（约毫秒级，远小于 8 秒）。
+v2 部分（lifecycle=True，显式选项）：
+4. 新增正常结果：两阶段可变借用（预约期共享读）+ 循环闭合干净；
+5. 棘手边界：同一条件的互斥分支不产生伪冲突，确定冲突给出可执行输入
+   （具体条件赋值 + 块游走）并逐步重放；
+6. 实际拒绝：预约后异常退出分支触发词法析构冲突，附可执行证据；
+7. 如实 unknown：压缩证据搜索预算后，抽象候选无法在预算内复现，
+   返回 unknown 而不是通过。
+
+运行：python demo.py（毫秒级，远小于 90 秒；无 sleep、无预录结果）。
 """
 
 from __future__ import annotations
@@ -149,6 +156,126 @@ def main() -> None:
         print(f"压缩预算后捕获 {type(exc).__name__}：{exc}")
     else:  # pragma: no cover
         raise AssertionError("预算必须被耗尽")
+
+    # ------------------------------------------------------------------
+    # v2 生命周期分析（lifecycle=True）
+    # ------------------------------------------------------------------
+    hr("4) v2 正常结果：两阶段借用（预约期共享读）+ 循环闭合干净")
+    lc_good = cfg_from_dict({
+        "conditions": ["c"],
+        "blocks": [
+            {"ops": [{"op": "declare", "var": "a",
+                      "ty": {"x": None, "y": None}}]},
+            {"ops": [
+                {"op": "borrow_reserve", "loan_id": "R",
+                 "path": ["a", "x"]},
+                {"op": "read", "path": ["a", "x"]},   # 预约期允许共享读
+                {"op": "read", "path": ["a", "y"]},
+                {"op": "borrow_activate", "loan_id": "R"},
+                {"op": "end_loan", "loan_id": "R"},
+            ]},
+            {"ops": []},
+        ],
+        "successors": [[1],
+                       [{"block": 1, "when": "c"},
+                        {"block": 2, "when": {"not": "c"}}],
+                       []],
+    })
+    lr = check(lc_good, lifecycle=True)
+    print(f"status={lr.status}（不动点块处理 {lr.iterations} 次）")
+    assert lr.status == "ok", lr.explain_evidence()
+
+    hr("5) v2 棘手边界：互斥分支不产生伪冲突；确定冲突给可执行输入")
+    # p 分支移动 a.x；!p 分支移动 a.y；汇合后分别读。两条读各只在一个
+    # 条件赋值下冲突，必须分别给出可执行输入（不是并集伪冲突）。
+    lc_branch = cfg_from_dict({
+        "conditions": ["p"],
+        "blocks": [
+            {"ops": [{"op": "declare", "var": "a",
+                      "ty": {"x": None, "y": None}}]},
+            {"ops": [{"op": "move", "path": ["a", "x"]}]},
+            {"ops": [{"op": "move", "path": ["a", "y"]}]},
+            {"ops": [
+                {"op": "read", "path": ["a", "x"]},
+                {"op": "read", "path": ["a", "y"]},
+            ]},
+        ],
+        "successors": [
+            [{"block": 1, "when": "p"},
+             {"block": 2, "when": {"not": "p"}}],
+            [3], [3], []],
+    })
+    br = check(lc_branch, lifecycle=True)
+    print(f"status={br.status}，确定冲突 {len(br.conflicts)} 条；"
+          f"unknown 原因 {len(br.unknown_reasons)} 条")
+    for ev in br.evidence:
+        assign = ", ".join(f"{k}={int(v)}"
+                           for k, v in sorted(ev.assignment.items()))
+        walk = " -> ".join(f"blocks[{b}]" for b in ev.walk)
+        print(f"  {ev.kind} @ blocks[{ev.block}].ops[{ev.op}]："
+              f"可执行输入 {{{assign}}}；游走 {walk}；"
+              f"现场复现={ev.reproduced}")
+    assert {(c.kind, c.block, c.op) for c in br.conflicts} == {
+        ("use_of_moved", 3, 0), ("use_of_moved", 3, 1)}
+    assert {e.assignment["p"] for e in br.evidence} == {True, False}
+
+    hr("6) v2 实际拒绝：预约后异常退出，词法析构撞上预约借用")
+    # 块0 declare + reserve a.x；ok 路径激活并结束后 drop（干净）；
+    # !ok 异常退出直接 drop：a.x 仍初始化且预约未激活 -> 确定冲突。
+    lc_drop = cfg_from_dict({
+        "conditions": ["ok"],
+        "blocks": [
+            {"ops": [
+                {"op": "declare", "var": "a", "ty": {"x": None}},
+                {"op": "borrow_reserve", "loan_id": "R",
+                 "path": ["a", "x"]},
+            ]},
+            {"ops": [
+                {"op": "borrow_activate", "loan_id": "R"},
+                {"op": "end_loan", "loan_id": "R"},
+                {"op": "drop"},
+            ]},
+            {"ops": [{"op": "drop"}]},
+        ],
+        "successors": [
+            [{"block": 1, "when": "ok"},
+             {"block": 2, "when": {"not": "ok"}}],
+            [], []],
+    })
+    dr = check(lc_drop, lifecycle=True)
+    print(f"status={dr.status}")
+    print(dr.explain_evidence())
+    assert dr.status == "conflict"
+    assert dr.evidence[0].assignment == {"ok": False}
+    assert dr.evidence[0].walk == (0, 2)
+
+    hr("7) v2 如实 unknown：证据搜索预算耗尽不等于通过")
+    # 与 6 同一形状的循环程序：把搜索预算压到极小，候选无法在预算内复现
+    # 时必须返回 unknown，而不是 clean 通行证。
+    lc_loop = cfg_from_dict({
+        "conditions": ["c"],
+        "blocks": [
+            {"ops": [{"op": "declare", "var": "a", "ty": {"x": None}}]},
+            {"ops": [
+                {"op": "borrow_reserve", "loan_id": "R",
+                 "path": ["a", "x"]},
+                {"op": "borrow_activate", "loan_id": "R"},
+            ]},
+            {"ops": []},
+        ],
+        "successors": [[1],
+                       [{"block": 1, "when": "c"},
+                        {"block": 2, "when": {"not": "c"}}],
+                       []],
+    })
+    tight = check(lc_loop, lifecycle=True, search_budget=1)
+    full = check(lc_loop, lifecycle=True)
+    print(f"压缩预算：status={tight.status} clean={tight.clean}；"
+          f"原因：{tight.unknown_reasons[0][:80]}...")
+    print(f"完整预算：status={full.status}，确定冲突 "
+          f"{len(full.conflicts)} 条（同一输入给确定答案）")
+    assert tight.status == "unknown" and not tight.clean
+    assert full.status == "conflict"
 
     elapsed = time.perf_counter() - started
     print(f"\n演示完成，实际耗时 {elapsed * 1000:.1f} ms（无 sleep、无预录结果）。")

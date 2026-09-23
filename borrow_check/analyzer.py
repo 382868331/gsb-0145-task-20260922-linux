@@ -27,12 +27,15 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .errors import BudgetExhaustedError
+from .errors import BudgetExhaustedError, CFGValidationError
 from .model import (
+    BorrowActivate,
     BorrowMut,
+    BorrowReserve,
     BorrowShared,
     CFG,
     Decl,
+    Drop,
     EndLoan,
     Move,
     Operation,
@@ -51,12 +54,17 @@ from .model import (
 class Witness:
     """一个抽象元素到达冲突点的前驱链。
 
-    :param kind: ``"moved"``（可能已移动路径）或 ``"loan"``（可能仍活跃借用）。
-    :param origin_block / origin_op: 元素诞生点（move 操作或 borrow 操作）。
+    :param kind: ``"moved"``（可能已移动路径）或 ``"loan"``（可能仍活跃/
+        预约的借用）。
+    :param origin_block / origin_op: 元素诞生点（move、borrow 或 reserve
+        操作）。
     :param block_chain: 从诞生块到冲突块（均含）的块下标链，例如
         ``(0, 2, 3)`` 表示元素在块0产生，经 0→2→3 到达块3 的冲突点。
     :param path: 元素作用路径。
-    :param loan_id / mode: loan 元素的 id 与 ``"shared"``/``"mut"``。
+    :param loan_id / mode: loan 元素的 id 与 ``"shared"``/``"mut"``
+        /``"reserved"``。
+    :param condition: v1 总是 ``None``；v2 生命周期分析中给出该见证相关的
+        条件原子名（``None`` 表示无条件），用于互斥分支区分与证据重放。
     """
 
     kind: str
@@ -66,6 +74,7 @@ class Witness:
     path: Path
     loan_id: Optional[str] = None
     mode: Optional[str] = None
+    condition: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -95,17 +104,54 @@ class CheckResult:
 
     :param clean: 无任何冲突为 ``True``（这是“证明无冲突”路径，
         与 :class:`BudgetExhaustedError` 的预算耗尽路径严格不同）。
-    :param conflicts: 按 (块, 操作) 顺序排列的全部冲突。
+        v2 生命周期模式下 ``status == "unknown"`` 时 ``clean`` 为 ``False``。
+    :param conflicts: 按 (块, 操作) 顺序排列的全部**确定**冲突。
     :param iterations: 到达不动点前的块处理次数（不含最终见证收集扫描）。
+    :param status: ``"ok"`` / ``"conflict"`` / ``"unknown"``。v1 模式
+        （``lifecycle=False``）只会出现前两种。
+    :param unknown_reasons: v2 中导致无法给出确定结论的具体原因元组
+        （部分条件下才成立的可能冲突、事实预算合并、证据搜索预算等）。
+    :param evidence: v2 中每个确定冲突对应的可执行输入与逐步重放。
+    :param lifecycle: 是否来自 v2 生命周期分析。
     """
 
     clean: bool
     conflicts: List[Conflict]
     iterations: int
+    status: str = "ok"
+    unknown_reasons: Tuple[str, ...] = ()
+    evidence: Tuple[object, ...] = ()
+    lifecycle: bool = False
 
     def explain(self) -> str:
         """渲染人类可读的冲突来源链（demo 使用）。"""
         return "\n".join(_render_conflict(c) for c in self.conflicts)
+
+    def explain_evidence(self) -> str:
+        """渲染 v2 确定冲突的可执行输入与逐步具体重放。"""
+        from .lifecycle import ExecutableEvidence  # 避免循环导入
+
+        lines: List[str] = []
+        for ev in self.evidence:
+            if not isinstance(ev, ExecutableEvidence):
+                continue
+            assign = ", ".join(
+                f"{k}={int(v)}" for k, v in sorted(ev.assignment.items()))
+            lines.append(
+                f"冲突 {ev.kind} @ blocks[{ev.block}].ops[{ev.op}] 的"
+                f"可执行输入：条件赋值 {{{assign}}}；块游走 "
+                f"{' -> '.join('blocks[%d]' % b for b in ev.walk)}")
+            for st in ev.steps:
+                lines.append(
+                    f"  blocks[{st.block}].ops[{st.op}] {st.op_name}"
+                    f"{(' ' + _fmt(st.path)) if st.path else ''}: {st.note}")
+            lines.append(
+                f"  诞生点 blocks[{ev.origin[0]}].ops[{ev.origin[1]}]；"
+                f"现场复现={ev.reproduced}")
+        if self.unknown_reasons:
+            lines.append("unknown 原因：")
+            lines.extend(f"  - {r}" for r in self.unknown_reasons)
+        return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -461,24 +507,71 @@ def _join(into: _State, other: _State) -> bool:
 # --------------------------------------------------------------------------
 
 
-def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
+def check(cfg: CFG, *, max_iterations: Optional[int] = None,
+          lifecycle: bool = False,
+          search_budget: Optional[int] = None) -> CheckResult:
     """对 CFG 运行字段敏感静态借用检查。
 
-    :param cfg: 已通过结构构造的 :class:`CFG`（``check`` 会先做完整语义校验）。
-    :param max_iterations: 块处理预算。默认取可证明上界
-        ``n * (P + L) + n``（n 块数、P 类型树路径数、L loan 数），
+    :param cfg: 已通过结构构造的 :class:`CFG``（``check`` 会先做完整语义校验）。
+    :param max_iterations: 块处理预算。v1 默认取可证明上界
+        ``E*(P+L) + n``（E 边数、P 类型树路径、L loan 数、n 块数），
         合法 CFG 不可能耗尽。传入更小的正数可在测试中演示
         :class:`BudgetExhaustedError` 与“无冲突”结论的区别。
+    :param lifecycle: ``False``（默认）走 v1 无条件 may 分析，行为与旧版
+        完全一致；``True`` 走 v2 生命周期引擎（初始化/部分移动/词法析构、
+        条件命题路径、两阶段可变借用，结论分 ok/conflict/unknown）。
+    :param search_budget: 仅 v2：确定冲突的可执行证据搜索状态预算，
+        默认 20000（4 轮展开）。缩小预算会使无法在预算内复现的抽象冲突
+        如实降级 ``unknown``（不会因此给出 clean）。
     :raises CFGValidationError: 非法输入（携带 location）。
-    :raises BudgetExhaustedError: 搜索预算耗尽。
+    :raises BudgetExhaustedError: 搜索预算耗尽（v2 同样与 clean 严格分离）。
     """
-    from .validator import validate_cfg
+    from .validator import validate_cfg, MAX_BLOCKS_LIFECYCLE
     from .errors import checked_int
 
-    validate_cfg(cfg)
+    validate_cfg(cfg, max_blocks=(MAX_BLOCKS_LIFECYCLE if lifecycle else 50))
 
     if max_iterations is not None:
         checked_int("max_iterations", max_iterations, min_value=1)
+    if search_budget is not None:
+        checked_int("search_budget", search_budget, min_value=1)
+
+    if lifecycle:
+        from .lifecycle import check_lifecycle, MAX_SEARCH_STATES
+
+        status, conflicts, iterations, unknown, evidence = check_lifecycle(
+            cfg, max_iterations=max_iterations,
+            search_budget=(search_budget if search_budget is not None
+                           else MAX_SEARCH_STATES))
+        return CheckResult(
+            clean=(status == "ok"),
+            conflicts=conflicts,
+            iterations=iterations,
+            status=status,
+            unknown_reasons=tuple(unknown),
+            evidence=tuple(evidence),
+            lifecycle=True,
+        )
+
+    # v1 引擎不识别 v2 操作与条件守卫：显式拒绝并提示迁移，避免被静默
+    # 忽略（尤其忽略边守卫会使 v1 的无条件并集结果相对守卫不健全）。
+    v2_ops = (BorrowReserve, BorrowActivate, Drop)
+    for bi, block in enumerate(cfg.blocks):
+        for oi, op in enumerate(block.ops):
+            if isinstance(op, v2_ops):
+                raise CFGValidationError(
+                    f"{type(op).__name__} 是 v2 生命周期操作，"
+                    "v1 may 引擎（lifecycle=False）不处理；"
+                    "请调用 check(cfg, lifecycle=True)，"
+                    "构造时用 cfg_from_dict(data, max_blocks=64)",
+                    f"blocks[{bi}].ops[{oi}]")
+    if cfg.conditions or (cfg.guards and any(
+            any(g is not None for g in glist) for glist in cfg.guards)):
+        raise CFGValidationError(
+            "conditions 与带 when 的边守卫是 v2 生命周期特性，"
+            "v1 may 引擎（lifecycle=False）会忽略它们导致结果相对守卫"
+            "不健全；请调用 check(cfg, lifecycle=True)",
+            "cfg.conditions")
 
     n = len(cfg.blocks)
     types: Dict[str, RecordNode] = {}

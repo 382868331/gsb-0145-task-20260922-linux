@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """固定输入的离线演示：真实运行 borrow_check。
 
-三部分（全部现场计算，无 sleep、无预录结果）：
+五部分（全部现场计算，无 sleep、无预录结果）：
 
 1. 正常结果：互不相交字段的独立借用，经分支/循环后干净通过；
 2. 实际拒绝：循环中未结束的借用，打印带前驱传播链的冲突来源；
-3. 异常边界：可定位的非法输入错误，以及“预算耗尽 != 证明无冲突”。
+3. 异常边界：可定位的非法输入错误，以及“预算耗尽 != 证明无冲突”；
+4. 片段调用（本次新增）：片段摘要 + 不同字段独立访问 clean，
+   同字段双可变借用 / 父子别名的拒绝（见证同时给调用位置与片段内路径）；
+5. 真正展开对照：同一逻辑手工展开成普通 CFG，与片段版逐项比较。
 
-运行：python demo.py（约毫秒级，远小于 8 秒）。
+运行：python demo.py（毫秒级，远小于 8 秒；片段演示 < 90 秒预算）。
 """
 
 from __future__ import annotations
@@ -17,8 +20,11 @@ import time
 from borrow_check import (
     BudgetExhaustedError,
     CFGValidationError,
+    build_summaries,
     cfg_from_dict,
     check,
+    check_program,
+    program_from_dict,
 )
 
 
@@ -150,8 +156,187 @@ def main() -> None:
     else:  # pragma: no cover
         raise AssertionError("预算必须被耗尽")
 
+    # ------------------------------------------------------------------
+    # 4) 片段调用（本次新增）：先形成摘要，再按实参替换接入不动点。
+    # ------------------------------------------------------------------
+    hr("4) 片段调用：摘要 + 实参替换（不假设形参互不重叠）")
+    # 片段 Touch(p, q)：各开一个可变借用，比较两个字段是否冲突。
+    touch = {
+        "name": "Touch",
+        "params": [
+            {"name": "p", "ty": None},
+            {"name": "q", "ty": None},
+        ],
+        "blocks": [{"ops": [
+            {"op": "borrow_mut", "loan_id": "lp", "path": ["p"]},
+            {"op": "borrow_mut", "loan_id": "lq", "path": ["q"]},
+            {"op": "end_loan", "loan_id": "lp"},
+            {"op": "end_loan", "loan_id": "lq"},
+        ]}],
+        "successors": [[]],
+    }
+
+    # 4a) 先打印形参命名空间摘要（前置条件 + 状态变化）。
+    summary_program = program_from_dict({
+        "cfg": {"blocks": [{"ops": [
+            {"op": "declare", "var": "r", "ty": {"x": None, "y": None}},
+            {"op": "invoke", "fragment": "Touch",
+             "args": {"p": ["r", "x"], "q": ["r", "y"]}},
+        ]}], "successors": [[]]},
+        "fragments": [touch],
+    })
+    summary = build_summaries(summary_program)["Touch"]
+    print(summary.describe())
+
+    # 4b) 不同字段独立访问：p=r.x, q=r.y -> clean。
+    disjoint = program_from_dict({
+        "cfg": {"blocks": [{"ops": [
+            {"op": "declare", "var": "r", "ty": {"x": None, "y": None}},
+            {"op": "invoke", "fragment": "Touch",
+             "args": {"p": ["r", "x"], "q": ["r", "y"]}},
+        ]}], "successors": [[]]},
+        "fragments": [touch],
+    })
+    res_disjoint = check_program(disjoint)
+    print(f"\n不同字段实参 (p=r.x, q=r.y)：clean = {res_disjoint.clean}")
+    assert res_disjoint.clean, res_disjoint.explain()
+
+    # 4c) 同字段双可变借用：p=q=r.x -> 片段内冲突。
+    same = program_from_dict({
+        "cfg": {"blocks": [{"ops": [
+            {"op": "declare", "var": "r", "ty": {"x": None, "y": None}},
+            {"op": "invoke", "fragment": "Touch",
+             "args": {"p": ["r", "x"], "q": ["r", "x"]}},
+        ]}], "successors": [[]]},
+        "fragments": [touch],
+    })
+    res_same = check_program(same)
+    print(f"同字段实参 (p=q=r.x)：clean = {res_same.clean}")
+    print(res_same.explain())
+    assert not res_same.clean
+
+    # 4d) 父子路径别名：p=r（父），q=r.x（子），片段借 p.x 与 q。
+    alias = {
+        "name": "Alias",
+        "params": [
+            {"name": "p", "ty": {"x": None}},
+            {"name": "q", "ty": None},
+        ],
+        "blocks": [{"ops": [
+            {"op": "borrow_mut", "loan_id": "lp", "path": ["p", "x"]},
+            {"op": "borrow_mut", "loan_id": "lq", "path": ["q"]},
+            {"op": "end_loan", "loan_id": "lp"},
+            {"op": "end_loan", "loan_id": "lq"},
+        ]}],
+        "successors": [[]],
+    }
+    aliased = program_from_dict({
+        "cfg": {"blocks": [{"ops": [
+            {"op": "declare", "var": "r", "ty": {"x": None}},
+            {"op": "invoke", "fragment": "Alias",
+             "args": {"p": ["r"], "q": ["r", "x"]}},
+        ]}], "successors": [[]]},
+        "fragments": [alias],
+    })
+    res_alias = check_program(aliased)
+    print(f"\n父子别名 (p=r, q=r.x)：clean = {res_alias.clean}（重叠冲突）")
+    assert not res_alias.clean
+
+    # ------------------------------------------------------------------
+    # 5) 真正展开对照：同一段逻辑手工展开为普通 CFG，逐项比较。
+    #    片段 MoveY(p)：某分支移动 p.y 后返回；调用后 r.y may 已移动。
+    # ------------------------------------------------------------------
+    hr("5) 真正展开对照：片段版 vs 手工展开普通 CFG")
+    movey_frag = {
+        "name": "MoveY",
+        "params": [{"name": "p", "ty": {"x": None, "y": None}}],
+        "blocks": [{"ops": [{"op": "move", "path": ["p", "y"]}]}],
+        "successors": [[]],
+    }
+    fragment_program = {
+        "cfg": {"blocks": [
+            {"ops": [
+                {"op": "declare", "var": "r", "ty": {"x": None, "y": None}},
+                {"op": "invoke", "fragment": "MoveY", "args": {"p": ["r"]}},
+            ]},
+            {"ops": [{"op": "read", "path": ["r", "y"]}]},
+        ], "successors": [[1], []]},
+        "fragments": [movey_frag],
+    }
+    expanded_cfg = cfg_from_dict({
+        "blocks": [
+            {"ops": [
+                {"op": "declare", "var": "r", "ty": {"x": None, "y": None}},
+                {"op": "move", "path": ["r", "y"]},  # 片段体按实参 p=r 替换
+            ]},
+            {"ops": [{"op": "read", "path": ["r", "y"]}]},
+        ],
+        "successors": [[1], []],
+    })
+    res_frag = check_program(program_from_dict(fragment_program))
+    res_exp = check(expanded_cfg)
+    frag_kp = sorted((c.kind, c.path) for c in res_frag.conflicts)
+    exp_kp = sorted((c.kind, c.path) for c in res_exp.conflicts)
+    print(f"片段版冲突 (kind,path) = {frag_kp}")
+    print(f"展开版冲突 (kind,path) = {exp_kp}")
+    assert frag_kp == exp_kp, "片段版与真正展开必须逐项一致"
+    print("两者逐项一致：片段内移动 p.y 按实参替换为 r.y，移动效果返回调用方；")
+    print("片段版见证锚定调用位置并附片段内路径，展开版锚定内联位置。")
+
     elapsed = time.perf_counter() - started
     print(f"\n演示完成，实际耗时 {elapsed * 1000:.1f} ms（无 sleep、无预录结果）。")
+
+    # ------------------------------------------------------------------
+    # 6) 有界规模的现场计算演示（确定性生成，远小于接口上限与 90 秒预算）。
+    #    规模说清：50 个主块（接口上限）、每块 1 个 invoke；3 层嵌套片段
+    #    （每片段 2 个前向块、每块 2 条借用相关指令）；模板内联后约
+    #    50 * 8 = 400 个模板块。不是上限压力测试（上限 100 000 模板操作），
+    #    只是一个现场跑完含调用不动点的中等程序。
+    # ------------------------------------------------------------------
+    hr("6) 有界规模现场计算（确定性生成，非上限压测）")
+    scale_started = time.perf_counter()
+    leaf = {"x": None, "y": None}
+    depth_frags = []
+    prev_name = None
+    for d in range(3):
+        name = f"Lvl{d}"
+        inner_call = ([{"op": "invoke", "fragment": prev_name,
+                        "args": {"p": ["p"]}}] if prev_name else [])
+        depth_frags.append({
+            "name": name,
+            "params": [{"name": "p", "ty": leaf}],
+            "blocks": [
+                {"ops": inner_call + [
+                    {"op": "borrow_mut", "loan_id": f"m{d}", "path": ["p", "x"]},
+                    {"op": "read", "path": ["p", "y"]},
+                    {"op": "end_loan", "loan_id": f"m{d}"},
+                ]},
+                {"ops": [{"op": "read", "path": ["p", "y"]}]},
+            ],
+            "successors": [[1], []],
+        })
+        prev_name = name
+    top_name = prev_name
+    main_blocks = [
+        {"ops": [{"op": "declare", "var": "r", "ty": leaf}]}
+    ]
+    for _ in range(49):
+        main_blocks.append({"ops": [
+            {"op": "invoke", "fragment": top_name, "args": {"p": ["r"]}},
+        ]})
+    # 链状主 CFG（0->1->...->49）。
+    big = program_from_dict({
+        "cfg": {"blocks": main_blocks,
+                "successors": [[i + 1] for i in range(49)] + [[]]},
+        "fragments": depth_frags,
+    })
+    big_res = check_program(big)
+    scale_ms = (time.perf_counter() - scale_started) * 1000
+    print(f"规模：50 主块 × 每块 1 个 invoke；3 层嵌套片段；clean="
+          f"{big_res.clean}，不动点块处理 {big_res.iterations} 次")
+    print(f"现场计算耗时 {scale_ms:.1f} ms（远小于 90 秒预算；非 100000 "
+          f"模板操作上限压测）。")
+    assert scale_ms < 90_000
 
 
 if __name__ == "__main__":

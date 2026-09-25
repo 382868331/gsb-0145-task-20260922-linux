@@ -27,13 +27,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .errors import BudgetExhaustedError
+from .errors import BudgetExhaustedError, CFGValidationError
 from .model import (
     BorrowMut,
     BorrowShared,
     CFG,
     Decl,
     EndLoan,
+    Invoke,
     Move,
     Operation,
     Path,
@@ -57,6 +58,10 @@ class Witness:
         ``(0, 2, 3)`` 表示元素在块0产生，经 0→2→3 到达块3 的冲突点。
     :param path: 元素作用路径。
     :param loan_id / mode: loan 元素的 id 与 ``"shared"``/``"mut"``。
+    :param frag_chain: 若元素诞生于片段调用内部，记录片段内 label 链
+        ``((片段名, 片段块, 片段操作), ...)``；``origin_block/op`` 锚定
+        调用位置。普通指令诞生的见证该字段为 ``None``。
+    :param frag_loan: 片段内局部借用见证：``(label 链, 局部 loan_id, mode)``。
     """
 
     kind: str
@@ -66,6 +71,8 @@ class Witness:
     path: Path
     loan_id: Optional[str] = None
     mode: Optional[str] = None
+    frag_chain: Optional[tuple] = None
+    frag_loan: Optional[tuple] = None
 
 
 @dataclass(frozen=True)
@@ -210,11 +217,15 @@ class _Transfer:
         types: Dict[str, RecordNode],
         loan_info: Dict[str, _LoanInfo],
         collect: bool,
+        invoke_handler: "object" = None,
     ) -> None:
         self.cfg = cfg
         self.types = types
         self.loan_info = loan_info
         self.collect = collect
+        # invoke_handler(st, block_idx, op_idx, Invoke) -> None
+        # 由 check_program 注入；普通 check 不允许 Invoke（validator 拦截）。
+        self.invoke_handler = invoke_handler
         self.conflicts: List[Conflict] = []
 
     # -- 见证辅助 ----------------------------------------------------------
@@ -344,6 +355,15 @@ class _Transfer:
         if isinstance(op, Decl):
             return
 
+        if isinstance(op, Invoke):
+            if self.invoke_handler is None:
+                # 普通 check 路径：validator 已禁止 Invoke；防御性报错。
+                raise CFGValidationError(
+                    "主 CFG 含 invoke 时必须用 check_program/program_from_dict",
+                    f"blocks[{bi}].ops[{oi}]")
+            self.invoke_handler(self, st, bi, oi, op)
+            return
+
         if isinstance(op, Move):
             moved_hits = self._disabled_by_move(st, op.path)
             for _, w in moved_hits:
@@ -431,7 +451,8 @@ def _lift(state: _State, succ_block: int) -> _State:
             dst[key] = Witness(
                 kind=w.kind, origin_block=w.origin_block, origin_op=w.origin_op,
                 block_chain=extend(w.block_chain, succ_block),
-                path=w.path, loan_id=w.loan_id, mode=w.mode)
+                path=w.path, loan_id=w.loan_id, mode=w.mode,
+                frag_chain=w.frag_chain, frag_loan=w.frag_loan)
     return lifted
 
 
@@ -491,13 +512,115 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
                 mode = "mut" if isinstance(op, BorrowMut) else "shared"
                 loan_info[op.loan_id] = _LoanInfo(bi, oi, mode, op.path)
 
+    ins, iterations = _solve_fixed_point(
+        cfg, types, loan_info, max_iterations, invoke_factory=None)
+
+    # 不动点已到：用最终入口状态做一次有序扫描，权威地收集冲突与见证。
+    conflicts: List[Conflict] = []
+    for bi in range(n):
+        transfer = _Transfer(cfg, types, loan_info, collect=True)
+        transfer.run_block(bi, ins[bi])
+        conflicts.extend(transfer.conflicts)
+
+    return CheckResult(clean=not conflicts, conflicts=conflicts, iterations=iterations)
+
+
+def check_program(program, *, max_iterations: Optional[int] = None) -> CheckResult:
+    """对含片段调用的 :class:`~borrow_check.model.Program` 运行借用检查。
+
+    片段先被归约为形参命名空间模板（调用图无环，自底向上内联）；主 CFG 的
+    不动点分析在每个 invoke 点把模板**按实参路径替换**为具体无环 CFG 并
+    单趟解释（may 合并），因此不假设形参互不重叠，别名情形与真正展开一致。
+
+    局部 loan 在片段退出时结束；移动与写回效果带回调用方。错误见证同时
+    给出调用位置（``block/op``）与片段内路径（``Witness.frag_chain``）。
+
+    :raises CFGValidationError: 程序（主 CFG / 片段 / 调用关系）非法。
+    :raises BudgetExhaustedError: 主不动点搜索预算耗尽（片段内为无环单趟，
+        不消耗主不动点迭代预算）。
+    """
+    from .validator import validate_program
+    from .errors import checked_int
+    from .fragments import (
+        build_templates,
+        instantiate,
+        run_invocation,
+        translate_conflict,
+    )
+
+    validate_program(program)
+    if max_iterations is not None:
+        checked_int("max_iterations", max_iterations, min_value=1)
+
+    cfg = program.cfg
+    n = len(cfg.blocks)
+    types: Dict[str, RecordNode] = {}
+    loan_info: Dict[str, _LoanInfo] = {}
+    for bi, block in enumerate(cfg.blocks):
+        for oi, op in enumerate(block.ops):
+            if isinstance(op, Decl):
+                types[op.var] = op.ty
+            elif isinstance(op, (BorrowShared, BorrowMut)):
+                mode = "mut" if isinstance(op, BorrowMut) else "shared"
+                loan_info[op.loan_id] = _LoanInfo(bi, oi, mode, op.path)
+
+    templates = build_templates(program)
+    # 每次调用都使用单调递增的调用序号，保证重复调用不复用上次调用的 loan
+    # 身份（局部 loan 虽在片段退出即结束，仍显式新鲜，便于排查）。
+    call_counter = [0]
+
+    def invoke_factory(collect: bool):
+        def handler(transfer, st, bi, oi, op):
+            tpl = templates[op.fragment]
+            call_counter[0] += 1
+            inst = instantiate(
+                tpl, op.args, id_prefix=f"c{bi}_{oi}#{call_counter[0]}")
+            # 以调用点当前状态为入口单趟解释实例化的无环 CFG。
+            out_state, raw = run_invocation(
+                inst, st, types, loan_info, (bi, oi), collect=collect)
+            # 片段出口效果就地写回，供同块后续指令使用。
+            st.moved_subtree = out_state.moved_subtree
+            st.moved_exact = out_state.moved_exact
+            st.loans = out_state.loans
+            if collect:
+                for c in raw:
+                    transfer.conflicts.append(
+                        translate_conflict(c, inst, (bi, oi)))
+        return handler
+
+
+    ins, iterations = _solve_fixed_point(
+        cfg, types, loan_info, max_iterations,
+        invoke_factory=invoke_factory)
+
+    conflicts: List[Conflict] = []
+    for bi in range(n):
+        transfer = _Transfer(cfg, types, loan_info, collect=True,
+                             invoke_handler=invoke_factory(True))
+        transfer.run_block(bi, ins[bi])
+        conflicts.extend(transfer.conflicts)
+    conflicts.sort(key=lambda c: (c.block, c.op))
+
+    return CheckResult(clean=not conflicts, conflicts=conflicts,
+                       iterations=iterations)
+
+
+def _solve_fixed_point(cfg: CFG, types, loan_info, max_iterations,
+                       invoke_factory):
+    """主 CFG 单调 worklist 不动点；返回 (每块入口状态, 块处理次数)。
+
+    ``invoke_factory(collect)`` 为每个 :class:`_Transfer` 产生 invoke 处理器；
+    普通 check 传 ``None``。
+    """
+    n = len(cfg.blocks)
     p_count = len(all_type_paths(types))
     l_count = len(loan_info)
     universe = all_type_paths(types)
     edge_count = sum(len(s) for s in cfg.successors)
     # 单调 worklist 的可证步数上界：每块出口外延至多严格增长 P+L 次；
     # 块 i 每次增长至多使 outdeg(i) 个后继入队，总入队数 ≤ E·(P+L)；
-    # 再加初始 n 次（含不可达块的空状态分析）。
+    # 再加初始 n 次（含不可达块的空状态分析）。invoke 的片段内是无环单趟，
+    # 不增加主格的迭代层数，故该上界对含调用程序同样成立。
     bound = edge_count * (p_count + l_count) + n
     budget = bound if max_iterations is None else max_iterations
 
@@ -508,7 +631,6 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
     for preds in predecessors.values():
         preds.sort()
 
-    # 记录每块抽象入口状态与每块出口的语义外延（用于单调变更判定）。
     ins: List[_State] = [_State() for _ in range(n)]
     outs: Dict[int, _State] = {}
     out_denot: Dict[int, Tuple[frozenset[Path], frozenset[str]]] = {}
@@ -526,7 +648,9 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
             if p in outs:
                 _join(merged, _lift(outs[p], idx))
         ins[idx] = merged
-        transfer = _Transfer(cfg, types, loan_info, collect=False)
+        handler = invoke_factory(False) if invoke_factory is not None else None
+        transfer = _Transfer(cfg, types, loan_info, collect=False,
+                             invoke_handler=handler)
         new_out = transfer.run_block(idx, merged)
         new_denot = _denotation(new_out, universe)
         changed = idx not in out_denot or out_denot[idx] != new_denot
@@ -534,7 +658,6 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
         out_denot[idx] = new_denot
         return changed
 
-    # 初始排入所有块：不可达块也以空入口状态被分析一次（之后不会被前驱更新）。
     worklist: deque[int] = deque(range(n))
     seen: set[int] = set(range(n))
     while worklist:
@@ -547,14 +670,7 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
                     worklist.append(s)
                     seen.add(s)
 
-    # 不动点已到：用最终入口状态做一次有序扫描，权威地收集冲突与见证。
-    conflicts: List[Conflict] = []
-    for bi in range(n):
-        transfer = _Transfer(cfg, types, loan_info, collect=True)
-        transfer.run_block(bi, ins[bi])
-        conflicts.extend(transfer.conflicts)
-
-    return CheckResult(clean=not conflicts, conflicts=conflicts, iterations=iterations)
+    return ins, iterations
 
 
 def _denotation(st: _State, universe: List[Path]) -> Tuple[frozenset[Path], frozenset[str]]:
@@ -579,17 +695,27 @@ def _denotation(st: _State, universe: List[Path]) -> Tuple[frozenset[Path], froz
 # --------------------------------------------------------------------------
 
 
+def _frag_label(chain) -> str:
+    return " -> ".join(f"{n}[{b}.{o}]" for n, b, o in chain)
+
+
 def _render_conflict(c: Conflict) -> str:
     head = f"冲突[{c.kind}] @ blocks[{c.block}].ops[{c.op}] ({c.op_name}): {c.detail}"
     lines = [head]
     for w in c.witnesses:
         chain = " -> ".join(f"blocks[{b}]" for b in w.block_chain)
-        if w.kind == "moved":
+        frag = f"，片段内: {_frag_label(w.frag_chain)}" if w.frag_chain else ""
+        if w.frag_loan is not None:
+            blabel, local_id, mode = w.frag_loan
+            origin = (f"片段局部 {mode} 借用 {local_id}@{_fmt(w.path)} "
+                      f"开始于片段内 {_frag_label(blabel)}{frag}")
+        elif w.kind == "moved":
             origin = (f"move {_fmt(w.path)} 诞生于 "
-                      f"blocks[{w.origin_block}].ops[{w.origin_op}]")
+                      f"blocks[{w.origin_block}].ops[{w.origin_op}]{frag}")
         else:
             origin = (f"{w.mode} 借用 {w.loan_id}@{_fmt(w.path)} 开始于 "
-                      f"blocks[{w.origin_block}].ops[{w.origin_op}]，之后未被 end_loan")
+                      f"blocks[{w.origin_block}].ops[{w.origin_op}]，"
+                      f"之后未被 end_loan{frag}")
         lines.append(f"    前驱见证: {origin}")
         lines.append(f"              传播链: {chain} -> blocks[{c.block}].ops[{c.op}]")
     return "\n".join(lines)

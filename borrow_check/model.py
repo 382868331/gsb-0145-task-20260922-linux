@@ -1,4 +1,4 @@
-"""公开数据结构：变量声明、记录树、操作、CFG。
+"""公开数据结构：变量声明、记录树、操作、CFG、可调用片段（fragment）。
 
 路径语义
 ========
@@ -15,8 +15,16 @@
 操作
 ====
 每个块含一个有序操作列表，操作类型为：``declare``、``move``、
-``borrow_shared``、``borrow_mut``、``end_loan``、``read``、``write``。
-每个 loan_id 静态唯一、作用于固定路径（在唯一的 borrow 处确定）。
+``borrow_shared``、``borrow_mut``、``end_loan``、``read``、``write``，
+以及片段调用 ``invoke``。每个 loan_id 静态唯一、作用于固定路径（在唯一的
+borrow 处确定）；片段内 loan_id 是**局部**于该片段的名字空间。
+
+片段
+====
+:class:`Fragment` 是由已有指令组成的**无环**小 CFG，只含显式路径形参
+（:class:`Param`，各带形参记录形状）与局部 loan，不含 ``declare``。
+片段之间的调用图也必须无环（不支持递归）。``invoke`` 处按实参路径把形参
+替换到主命名空间；两个形参可以指向同一记录的不同字段，也可以完全别名。
 """
 
 from __future__ import annotations
@@ -91,7 +99,21 @@ class Write:
     reinit: bool = False
 
 
-Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write]
+@dataclass(frozen=True)
+class Invoke:
+    """invoke：操作片段调用（本次新增）。
+
+    :param fragment: 被调用片段名（必须在 :class:`Program` 的片段表中）。
+    :param args: 形参名 -> 调用方实参路径（主命名空间中的具体路径）。
+        每个形参必须恰好给一次实参；两个形参可绑定到同一记录的不同
+        字段（如 ``a.x``、``a.y``），也可绑定到相互重叠（别名）的路径。
+    """
+
+    fragment: str
+    args: Dict[str, Path] = field(default_factory=dict)
+
+
+Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write, Invoke]
 
 _OP_KINDS = {
     "declare": Decl,
@@ -101,7 +123,54 @@ _OP_KINDS = {
     "end_loan": EndLoan,
     "read": Read,
     "write": Write,
+    "invoke": Invoke,
 }
+
+
+@dataclass(frozen=True)
+class Param:
+    """片段形参：显式路径形参。
+
+    :param name: 形参名（非空字符串），在片段内作为路径根使用，
+        例如形参 ``p`` 的字段写作 ``("p", "x")``。
+    :param ty: 形参记录形状（与 declare 的 ty 同构：dict 内部节点 / None 叶子）。
+        片段内对 ``p.<...>`` 的访问必须落在该形状内；调用点实参路径所在
+        实际类型必须至少包含该形状。
+    """
+
+    name: str
+    ty: Optional[Dict[str, RecordNode]] = None
+
+
+@dataclass
+class Fragment:
+    """操作片段：由已有指令组成的**无环**小 CFG。
+
+    :param name: 片段名（非空字符串，在 :class:`Program` 内唯一）。
+    :param params: 显式形参列表（形参名唯一）。
+    :param blocks: 片段基本块（下标即块 id，最多 50）。块内指令只允许引用
+        形参路径根与局部 loan_id；**不含** ``declare``。
+    :param successors: 片段 CFG 边，结构性无环（只准连向更大下标，且不可自环）。
+    :param entry: 片段入口块下标。
+    """
+
+    name: str
+    params: List[Param]
+    blocks: List[Block]
+    successors: List[List[int]]
+    entry: int = 0
+
+
+@dataclass
+class Program:
+    """主 CFG + 片段表。
+
+    :param cfg: 主控制流图（其块内可出现 :class:`Invoke`）。
+    :param fragments: 片段名 -> :class:`Fragment`。片段调用图必须无环。
+    """
+
+    cfg: CFG
+    fragments: Dict[str, Fragment] = field(default_factory=dict)
 
 
 @dataclass
@@ -202,6 +271,8 @@ def operation_from_dict(data: object, loc: str) -> Operation:
             if not _is_ident(loan_id):
                 raise CFGValidationError("loan_id 必须是非空字符串", f"{loc}.loan_id")
             return EndLoan(loan_id=loan_id)
+        if kind == "invoke":
+            return _invoke_from_dict(data, loc)
         # write
         _require_keys(data, frozenset({"op", "path", "reinit"}), loc)
         path = _validate_path(data.get("path"), f"{loc}.path")
@@ -215,28 +286,44 @@ def operation_from_dict(data: object, loc: str) -> Operation:
         raise CFGValidationError(str(exc), loc) from exc
 
 
-def cfg_from_dict(data: object) -> CFG:
-    """从纯数据构造并完整校验 :class:`CFG`。
+def _invoke_from_dict(data: dict, loc: str) -> Invoke:
+    _require_keys(data, frozenset({"op", "fragment", "args"}), loc)
+    fragment = data.get("fragment")
+    if not _is_ident(fragment):
+        raise CFGValidationError("fragment 必须是非空字符串", f"{loc}.fragment")
+    raw_args = data.get("args")
+    if not isinstance(raw_args, dict) or not raw_args:
+        raise CFGValidationError(
+            "args 必须是非空对象（形参名 -> 实参路径）", f"{loc}.args")
+    args: Dict[str, Path] = {}
+    for pname, ppath in raw_args.items():
+        if not _is_ident(pname):
+            raise CFGValidationError(
+                "形参名必须是非空字符串", f"{loc}.args[{pname!r}]")
+        args[pname] = _validate_path(ppath, f"{loc}.args[{pname!r}]")
+    return Invoke(fragment=fragment, args=args)  # type: ignore[arg-type]
 
-    结构校验（块数、边、下标）与 :func:`validate_cfg` 的语义校验分离，
-    构造函数只负责形状；语义（重复声明、路径越界、loan 规则）在分析前
-    由 :func:`validate_cfg` 一次性完成。
+
+def _cfg_structural_from_dict(data: object, loc: str = "cfg") -> CFG:
+    """只做形状构造（块/边/下标/操作字面量），不跑语义校验。
+
+    语义校验（声明支配、路径越界、invoke 规则等）由 :func:`validate_cfg`
+    或 :func:`validate_program` 在分析前统一完成。
     """
-    loc = "cfg"
     if not isinstance(data, dict):
         raise CFGValidationError("CFG 必须是对象", loc)
     _require_keys(data, frozenset({"blocks", "successors", "entry"}), loc)
     raw_blocks = data.get("blocks")
     if not isinstance(raw_blocks, list):
-        raise CFGValidationError("blocks 必须是列表", "cfg.blocks")
+        raise CFGValidationError("blocks 必须是列表", f"{loc}.blocks")
     if not raw_blocks:
-        raise CFGValidationError("至少需要 1 个块", "cfg.blocks")
+        raise CFGValidationError("至少需要 1 个块", f"{loc}.blocks")
     if len(raw_blocks) > 50:
-        raise CFGValidationError("块数上限为 50", "cfg.blocks")
+        raise CFGValidationError("块数上限为 50", f"{loc}.blocks")
 
     blocks: List[Block] = []
     for bi, raw_block in enumerate(raw_blocks):
-        bloc = f"blocks[{bi}]"
+        bloc = f"blocks[{bi}]" if loc == "cfg" else f"{loc}.blocks[{bi}]"
         if not isinstance(raw_block, dict) or not isinstance(raw_block.get("ops"), list):
             raise CFGValidationError("块必须是含 ops 列表的对象", f"{bloc}.ops")
         if len(raw_block["ops"]) > 10000:
@@ -250,11 +337,11 @@ def cfg_from_dict(data: object) -> CFG:
     raw_succ = data.get("successors")
     if not isinstance(raw_succ, list) or len(raw_succ) != len(blocks):
         raise CFGValidationError(
-            "successors 必须是与 blocks 等长的列表", "cfg.successors"
+            "successors 必须是与 blocks 等长的列表", f"{loc}.successors"
         )
     successors: List[List[int]] = []
     for bi, raw_list in enumerate(raw_succ):
-        sloc = f"successors[{bi}]"
+        sloc = f"successors[{bi}]" if loc == "cfg" else f"{loc}.successors[{bi}]"
         if not isinstance(raw_list, list):
             raise CFGValidationError("每个后继列表必须是列表", sloc)
         succ: List[int] = []
@@ -271,10 +358,97 @@ def cfg_from_dict(data: object) -> CFG:
     entry = data.get("entry", 0)
     checked_int("entry", entry, min_value=0)
     if entry >= len(blocks):
-        raise CFGValidationError(f"入口块下标 {entry} 越界", "cfg.entry")
-    cfg = CFG(blocks=blocks, successors=successors, entry=entry)
+        raise CFGValidationError(f"入口块下标 {entry} 越界", f"{loc}.entry")
+    return CFG(blocks=blocks, successors=successors, entry=entry)
+
+
+def cfg_from_dict(data: object) -> CFG:
+    """从纯数据构造并完整校验 :class:`CFG`（不含 invoke 的普通 CFG）。
+
+    结构校验（块数、边、下标）与 :func:`validate_cfg` 的语义校验分离，
+    构造函数只负责形状；语义（重复声明、路径越界、loan 规则）在分析前
+    由 :func:`validate_cfg` 一次性完成。含片段调用的程序请用
+    :func:`program_from_dict`。
+    """
+    cfg = _cfg_structural_from_dict(data, "cfg")
     # 构造即完成全部语义校验；失败时不返回任何对象（无部分结果）。
     from .validator import validate_cfg
 
     validate_cfg(cfg)
     return cfg
+
+
+def fragment_from_dict(data: object, loc: str = "fragment") -> Fragment:
+    """从纯数据构造片段（只做形状与字面量校验；片段语义在 validate_program 完成）。"""
+    if not isinstance(data, dict):
+        raise CFGValidationError("片段必须是对象", loc)
+    _require_keys(
+        data, frozenset({"name", "params", "blocks", "successors", "entry"}), loc)
+
+    name = data.get("name")
+    if not _is_ident(name):
+        raise CFGValidationError("片段 name 必须是非空字符串", f"{loc}.name")
+
+    raw_params = data.get("params")
+    if not isinstance(raw_params, list) or not raw_params:
+        raise CFGValidationError(
+            "params 必须是非空列表（片段至少一个显式路径形参）", f"{loc}.params")
+    params: List[Param] = []
+    seen_params: set[str] = set()
+    for pi, raw_p in enumerate(raw_params):
+        ploc = f"{loc}.params[{pi}]"
+        if not isinstance(raw_p, dict):
+            raise CFGValidationError("形参必须是对象", ploc)
+        _require_keys(raw_p, frozenset({"name", "ty"}), ploc)
+        pname = raw_p.get("name")
+        if not _is_ident(pname):
+            raise CFGValidationError("形参 name 必须是非空字符串", f"{ploc}.name")
+        if pname in seen_params:
+            raise CFGValidationError(f"形参 {pname!r} 重复", f"{ploc}.name")
+        seen_params.add(pname)
+        ty = _validate_type(raw_p.get("ty"), f"{ploc}.ty")
+        params.append(Param(name=pname, ty=ty))
+
+    cfg = _cfg_structural_from_dict(
+        {"blocks": data["blocks"], "successors": data["successors"],
+         "entry": data.get("entry", 0)},
+        loc=loc,
+    )
+    return Fragment(name=name, params=params, blocks=cfg.blocks,
+                    successors=cfg.successors, entry=cfg.entry)
+
+
+def program_from_dict(data: object) -> Program:
+    """从纯数据构造并完整校验 :class:`Program`（主 CFG + 命名片段）。
+
+    格式::
+
+        {
+          "cfg": { ... 主 CFG（块内可含 invoke）... },
+          "fragments": [ { "name": ..., "params": [...], "blocks": ...,
+                           "successors": ..., "entry": 0 }, ... ]
+        }
+    """
+    loc = "program"
+    if not isinstance(data, dict):
+        raise CFGValidationError("Program 必须是对象", loc)
+    _require_keys(data, frozenset({"cfg", "fragments"}), loc)
+
+    cfg = _cfg_structural_from_dict(data["cfg"], loc="cfg")
+
+    raw_frags = data.get("fragments")
+    if not isinstance(raw_frags, list):
+        raise CFGValidationError("fragments 必须是列表（可为空）", f"{loc}.fragments")
+    fragments: Dict[str, Fragment] = {}
+    for fi, raw_f in enumerate(raw_frags):
+        frag = fragment_from_dict(raw_f, loc=f"fragments[{fi}]")
+        if frag.name in fragments:
+            raise CFGValidationError(
+                f"片段 {frag.name!r} 重名", f"fragments[{fi}].name")
+        fragments[frag.name] = frag
+
+    program = Program(cfg=cfg, fragments=fragments)
+    from .validator import validate_program
+
+    validate_program(program)
+    return program

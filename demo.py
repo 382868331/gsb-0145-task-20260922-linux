@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """固定输入的离线演示：真实运行 borrow_check。
 
-三部分（全部现场计算，无 sleep、无预录结果）：
+四部分（全部现场计算，无 sleep、无预录结果）：
 
 1. 正常结果：互不相交字段的独立借用，经分支/循环后干净通过；
 2. 实际拒绝：循环中未结束的借用，打印带前驱传播链的冲突来源；
-3. 异常边界：可定位的非法输入错误，以及“预算耗尽 != 证明无冲突”。
+3. 异常边界：可定位的非法输入错误，以及“预算耗尽 != 证明无冲突”；
+4. 操作片段调用：同字段双可变借用拒绝（调用位置 + 片段内路径）、不同字段
+   独立通过、某分支移动后的写回、局部 loan 退出即结束/重复调用身份独立，
+   并把一个含环主 CFG **真正展开**成普通 CFG，与摘要检查逐项比较冲突。
 
-运行：python demo.py（约毫秒级，远小于 8 秒）。
+运行：python demo.py（约毫秒级，远小于 90 秒）。
 """
 
 from __future__ import annotations
@@ -19,6 +22,8 @@ from borrow_check import (
     CFGValidationError,
     cfg_from_dict,
     check,
+    check_program,
+    program_from_dict,
 )
 
 
@@ -149,6 +154,139 @@ def main() -> None:
         print(f"压缩预算后捕获 {type(exc).__name__}：{exc}")
     else:  # pragma: no cover
         raise AssertionError("预算必须被耗尽")
+
+    # ------------------------------------------------------------------
+    # 4) 操作片段调用（本次新增）。
+    #    片段 swap_borrow(p, q)：对 p、q 各开一个可变借用，用完各自结束。
+    #    片段 maybe_move(p)：无环菱形，一个分支 move p 后返回。
+    # ------------------------------------------------------------------
+    hr("4) 操作片段调用：摘要前置条件 + 实参替换（别名/独立/写回）")
+    seg_swap = {
+        "params": ["p", "q"],
+        "blocks": [{"ops": [
+            {"op": "borrow_mut", "loan_id": "Lp", "path": ["p"]},
+            {"op": "borrow_mut", "loan_id": "Lq", "path": ["q"]},
+            {"op": "end_loan", "loan_id": "Lp"},
+            {"op": "end_loan", "loan_id": "Lq"},
+        ]}],
+        "successors": [[]], "entry": 0,
+    }
+    seg_move = {
+        "params": ["p"],
+        "blocks": [
+            {"ops": []},
+            {"ops": [{"op": "move", "path": ["p"]}]},
+            {"ops": []},
+        ],
+        "successors": [[1, 2], [2], []], "entry": 0,
+    }
+    segments = {"swap_borrow": seg_swap, "maybe_move": seg_move}
+
+    def prog_with_call(call_ops):
+        return {
+            "cfg": {"blocks": [{"ops": [
+                {"op": "declare", "var": "r",
+                 "ty": {"a": None, "b": None}},
+                *call_ops,
+            ]}], "successors": [[]], "entry": 0},
+            "segments": segments,
+        }
+
+    # 4a) 同字段双可变借用：p=q=r.a（不默认形参互不重叠）。
+    same = program_from_dict(prog_with_call([
+        {"op": "call", "segment": "swap_borrow",
+         "args": [["p", ["r", "a"]], ["q", ["r", "a"]]]}]))
+    r_same = check_program(same)
+    print(f"4a 同字段 p=q=r.a：clean={r_same.clean}，冲突 {len(r_same.conflicts)} 个")
+    print(r_same.explain())
+    assert not r_same.clean
+    c0 = r_same.conflicts[0]
+    assert (c0.block, c0.op, c0.seg_block, c0.seg_op) == (0, 1, 0, 1)
+
+    # 4b) 父子别名 p=r、q=r.a：对称重叠 -> 冲突。
+    parent_child = program_from_dict(prog_with_call([
+        {"op": "call", "segment": "swap_borrow",
+         "args": [["p", ["r"]], ["q", ["r", "a"]]]}]))
+    r_pc = check_program(parent_child)
+    print(f"\n4b 父子别名 p=r,q=r.a：clean={r_pc.clean}（冲突 {len(r_pc.conflicts)} 个）")
+    assert not r_pc.clean
+
+    # 4c) 不同字段 p=r.a、q=r.b：互不相交 -> 干净。
+    distinct = program_from_dict(prog_with_call([
+        {"op": "call", "segment": "swap_borrow",
+         "args": [["p", ["r", "a"]], ["q", ["r", "b"]]]}]))
+    r_dist = check_program(distinct)
+    print(f"4c 不同字段 p=r.a,q=r.b：clean={r_dist.clean}")
+    assert r_dist.clean
+
+    # 4d) 某分支移动后返回：调用后读 r.a may-moved，兄弟 r.b 可用。
+    moved = program_from_dict(prog_with_call([
+        {"op": "call", "segment": "maybe_move", "args": [["p", ["r", "a"]]]},
+        {"op": "read", "path": ["r", "a"]},
+        {"op": "read", "path": ["r", "b"]},
+    ]))
+    r_mv = check_program(moved)
+    print(f"4d 分支移动后返回：clean={r_mv.clean}，冲突 {len(r_mv.conflicts)} 个")
+    print(r_mv.conflicts[0].detail, "| 见证片段坐标:",
+          (r_mv.conflicts[0].witnesses[0].seg_block,
+           r_mv.conflicts[0].witnesses[0].seg_op,
+           r_mv.conflicts[0].witnesses[0].formal_path))
+    assert {(c.kind, c.block, c.op) for c in r_mv.conflicts} == \
+        {("use_of_moved", 0, 2)}
+
+    # 4e) 局部 loan 退出即结束 + 重复调用身份独立。
+    seg_hold = {
+        "params": ["p"],
+        "blocks": [{"ops": [
+            {"op": "borrow_mut", "loan_id": "H", "path": ["p"]},
+            {"op": "read", "path": ["p"]}]}],
+        "successors": [[]], "entry": 0,
+    }
+    rep = program_from_dict({
+        "cfg": {"blocks": [{"ops": [
+            {"op": "declare", "var": "r", "ty": {"a": None}},
+            {"op": "call", "segment": "hold", "args": [["p", ["r", "a"]]]},
+            {"op": "call", "segment": "hold", "args": [["p", ["r", "a"]]]},
+            {"op": "write", "path": ["r", "a"]},  # 局部 loan 已退出：合法
+        ]}], "successors": [[]], "entry": 0},
+        "segments": {"hold": seg_hold}})
+    r_rep = check_program(rep)
+    # 每次调用恰好 1 个片段内 read_while_mut；无跨调用 borrow_conflict。
+    assert {(c.kind, c.block, c.op) for c in r_rep.conflicts} == \
+        {("read_while_mut_borrowed", 0, 1), ("read_while_mut_borrowed", 0, 2)}
+    print("4e 两次调用各 1 个片段内冲突，调用后写合法：局部 loan 不串用、不泄漏")
+
+    # 4f) 真正展开一个含环主 CFG，与摘要检查逐项比较。
+    from tests._inline import inline_program, normalize_conflict_key
+    cyclic = {
+        "cfg": {
+            "blocks": [
+                {"ops": [{"op": "declare", "var": "r",
+                          "ty": {"a": None, "b": None}}]},
+                {"ops": [
+                    {"op": "call", "segment": "hold",
+                     "args": [["p", ["r", "a"]]]},
+                    {"op": "read", "path": ["r", "b"]},
+                ]},
+            ],
+            # 块0 -> 块1，块1 自环：摘要调用接入主 CFG 不动点。
+            "successors": [[1], [1]], "entry": 0,
+        },
+        "segments": {"hold": seg_hold},
+    }
+    inlined, origins = inline_program(cyclic)
+    r_inline = check(cfg_from_dict(inlined))
+    r_summary = check_program(program_from_dict(cyclic))
+    inline_keys = set()
+    for c in r_inline.conflicts:
+        _, mb, mo, sb, so = normalize_conflict_key(c.block, c.op, origins)
+        inline_keys.add((c.kind, mb, mo, sb, so))
+    summary_keys = {(c.kind, c.block, c.op, c.seg_block, c.seg_op)
+                    for c in r_summary.conflicts}
+    print(f"4f 含环主 CFG：展开为 {len(inlined['blocks'])} 个普通块，"
+          f"展开冲突 {len(inline_keys)} 个，摘要冲突 {len(summary_keys)} 个，"
+          f"逐项一致={inline_keys == summary_keys}")
+    assert inline_keys == summary_keys
 
     elapsed = time.perf_counter() - started
     print(f"\n演示完成，实际耗时 {elapsed * 1000:.1f} ms（无 sleep、无预录结果）。")

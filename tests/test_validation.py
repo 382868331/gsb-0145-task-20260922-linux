@@ -235,6 +235,20 @@ class TestBudgetVsClean(unittest.TestCase):
         with self.assertRaises(ValueError):
             check(self._loop_cfg(), max_iterations=0)
 
+    def test_default_bound_covers_backedge_requeue(self):
+        # 回归：3 块图含回边与自环（L=0）。回边会把已处理块重新入队，
+        # 默认可证明上界必须覆盖“每块外延首次记录”，不能误报预算耗尽。
+        cfg = cfg_from_dict({
+            "blocks": [
+                {"ops": [{"op": "declare", "var": "v", "ty": None}]},
+                {"ops": [{"op": "move", "path": ["v"]}]},
+                {"ops": [{"op": "read", "path": ["v"]}]},
+            ],
+            "successors": [[1, 0], [2, 0], [1]],
+        })
+        result = check(cfg)  # 不抛 BudgetExhaustedError
+        self.assertFalse(result.clean)
+
 
 if __name__ == "__main__":
     unittest.main()

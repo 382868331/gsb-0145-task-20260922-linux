@@ -25,15 +25,20 @@ from .model import (
     BorrowMut,
     BorrowShared,
     CFG,
+    Call,
     Decl,
     EndLoan,
     Move,
     Operation,
     Path,
+    Program,
     Read,
+    Segment,
     Write,
     cfg_from_dict,
     operation_from_dict,
+    program_from_dict,
+    segment_from_dict,
 )
 from .analyzer import (
     CheckResult,
@@ -41,8 +46,16 @@ from .analyzer import (
     Witness,
     all_type_paths,
     check,
+    check_program,
 )
-from .validator import MAX_BLOCKS, MAX_OPS_PER_BLOCK, validate_cfg
+from .summaries import (
+    Precondition,
+    SegmentEffect,
+    SegmentSummary,
+    build_summaries,
+    summarize_segment,
+)
+from .validator import MAX_BLOCKS, MAX_OPS_PER_BLOCK, validate_cfg, validate_program
 
 __all__ = [
     # model
@@ -50,25 +63,38 @@ __all__ = [
     "BorrowMut",
     "BorrowShared",
     "CFG",
+    "Call",
     "Decl",
     "EndLoan",
     "Move",
     "Operation",
     "Path",
+    "Program",
     "Read",
+    "Segment",
     "Write",
     "cfg_from_dict",
     "operation_from_dict",
+    "program_from_dict",
+    "segment_from_dict",
+    # summaries
+    "Precondition",
+    "SegmentEffect",
+    "SegmentSummary",
+    "build_summaries",
+    "summarize_segment",
     # validation
     "MAX_BLOCKS",
     "MAX_OPS_PER_BLOCK",
     "validate_cfg",
+    "validate_program",
     # analysis
     "CheckResult",
     "Conflict",
     "Witness",
     "all_type_paths",
     "check",
+    "check_program",
     # errors
     "BorrowCheckError",
     "BudgetExhaustedError",

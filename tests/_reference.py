@@ -8,6 +8,10 @@
 2. 对**无环** CFG（DAG）枚举从入口到汇点的所有块序列，对每条序列做
    精确（逐路径）执行解释，再按 may 语义取并集。
 3. 活跃借用沿块序列精确维护集合。
+4. 预约（reserve/activate）：逐条块序列精确维护预约状态
+   （reserved/activated/已结束）。activate/end_loan 的“所有路径都存活”
+   要求在枚举语义下等价于“存在一条到达路径不存活即报
+   reservation_not_live”。
 
 被测核心用反链 + 单调不动点；本参考用有限位向量 + 全路径枚举。
 两者在 DAG 上的冲突集合（kind, 块, 操作）必须一致。
@@ -53,6 +57,7 @@ def reference_conflicts(cfg_dict: Dict[str, Any]) -> Set[ConflictKey]:
 
     loan_path: Dict[str, Tuple[str, ...]] = {}
     loan_mode: Dict[str, str] = {}
+    res_path: Dict[str, Tuple[str, ...]] = {}
     for b in blocks:
         for op in b["ops"]:
             if op["op"] in ("borrow_shared", "borrow_mut"):
@@ -60,6 +65,8 @@ def reference_conflicts(cfg_dict: Dict[str, Any]) -> Set[ConflictKey]:
                 loan_mode[op["loan_id"]] = (
                     "mut" if op["op"] == "borrow_mut" else "shared"
                 )
+            elif op["op"] == "reserve":
+                res_path[op["reservation_id"]] = tuple(op["path"])
 
     # 2) 枚举 DAG 上全部入口->汇点块序列（调用方保证 n 很小）。
     sinks = [i for i in range(n) if not succs[i]]
@@ -87,6 +94,7 @@ def reference_conflicts(cfg_dict: Dict[str, Any]) -> Set[ConflictKey]:
     for seq in walks:
         moved = [False] * len(paths)
         active: Set[str] = set()
+        res_state: Dict[str, str] = {}  # reservation_id -> "reserved"/"activated"
 
         def moved_overlap(p: Tuple[str, ...]) -> bool:
             # 位向量存的是外延（每条不可用路径各占一位）：do_move 已把
@@ -114,6 +122,15 @@ def reference_conflicts(cfg_dict: Dict[str, Any]) -> Set[ConflictKey]:
                 hit.append(lid)
             return hit
 
+        def res_overlap(p: Tuple[str, ...], activated_only: bool,
+                        exclude: str = "") -> List[str]:
+            return [
+                rid for rid, stt in res_state.items()
+                if rid != exclude
+                and (not activated_only or stt == "activated")
+                and _overlap(res_path[rid], p)
+            ]
+
         for bi in seq:
             for oi, op in enumerate(blocks[bi]["ops"]):
                 kind_op = op["op"]
@@ -123,30 +140,52 @@ def reference_conflicts(cfg_dict: Dict[str, Any]) -> Set[ConflictKey]:
                 if kind_op == "move":
                     if moved_overlap(p):
                         conflicts.add(("use_of_moved", bi, oi))
-                    if active_overlap(p, "mut_any_mode"):
+                    if active_overlap(p, "mut_any_mode") or res_overlap(p, False):
                         conflicts.add(("move_while_borrowed", bi, oi))
                     do_move(p)
                 elif kind_op == "borrow_shared":
                     if moved_overlap(p):
                         conflicts.add(("use_of_moved", bi, oi))
-                    if active_overlap(p, "shared"):
+                    if active_overlap(p, "shared") or res_overlap(p, True):
                         conflicts.add(("borrow_conflict", bi, oi))
                     active.add(op["loan_id"])
                 elif kind_op == "borrow_mut":
                     if moved_overlap(p):
                         conflicts.add(("use_of_moved", bi, oi))
-                    if active_overlap(p, "mut_any_mode"):
+                    if active_overlap(p, "mut_any_mode") or res_overlap(p, False):
                         conflicts.add(("borrow_conflict", bi, oi))
                     active.add(op["loan_id"])
                 elif kind_op == "end_loan":
-                    active.discard(op["loan_id"])
+                    lid = op["loan_id"]
+                    if lid in res_path:
+                        if lid not in res_state:
+                            conflicts.add(("reservation_not_live", bi, oi))
+                        res_state.pop(lid, None)
+                    else:
+                        active.discard(lid)
+                elif kind_op == "reserve":
+                    rid = op["reservation_id"]
+                    if moved_overlap(p):
+                        conflicts.add(("use_of_moved", bi, oi))
+                    if active_overlap(p, "shared") or res_overlap(p, True):
+                        conflicts.add(("reserve_conflict", bi, oi))
+                    res_state[rid] = "reserved"
+                elif kind_op == "activate":
+                    rid = op["reservation_id"]
+                    rp = res_path[rid]
+                    if res_state.get(rid) != "reserved":
+                        conflicts.add(("reservation_not_live", bi, oi))
+                    if active_overlap(rp, "mut_any_mode") or res_overlap(rp, False, rid):
+                        conflicts.add(("activate_conflict", bi, oi))
+                    if rid in res_state:
+                        res_state[rid] = "activated"
                 elif kind_op == "read":
                     if moved_overlap(p):
                         conflicts.add(("use_of_moved", bi, oi))
-                    if active_overlap(p, "shared"):
+                    if active_overlap(p, "shared") or res_overlap(p, True):
                         conflicts.add(("read_while_mut_borrowed", bi, oi))
                 elif kind_op == "write":
-                    if active_overlap(p, "mut_any_mode"):
+                    if active_overlap(p, "mut_any_mode") or res_overlap(p, False):
                         conflicts.add(("write_while_borrowed", bi, oi))
                     if op.get("reinit", False):
                         do_reinit(p)

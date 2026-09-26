@@ -7,7 +7,8 @@
 根变量恰好 declare 一次；declare 必须在 CFG 上**支配**每个使用点
 （块内要求操作下标不早于声明，跨块要求声明块支配使用块；不可达块豁免）；
 所有路径在记录树中存在；loan_id 全局唯一对应一个 borrow，
-end_loan 必须引用已存在的 loan。
+reservation_id 全局唯一对应一个 reserve（两者共用同一标识命名空间），
+end_loan 必须引用已存在的 loan 或预约，activate 必须引用已存在的预约。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 from .errors import CFGValidationError, checked_int
 from .model import (
+    Activate,
     Block,
     BorrowMut,
     BorrowShared,
@@ -27,6 +29,7 @@ from .model import (
     Operation,
     Path,
     Read,
+    Reserve,
     Write,
 )
 
@@ -72,6 +75,8 @@ def validate_cfg(cfg: CFG) -> None:
     declared: Dict[str, Decl] = {}
     decl_site: Dict[str, Tuple[int, int]] = {}
     loan_site: Dict[str, Operation] = {}
+    reservation_ids: Set[str] = set()
+    activate_sites: List[Tuple[int, int, str]] = []
     op_path_users: List[Tuple[int, int, Operation, Path]] = []
     type_node_counter = [0]
 
@@ -123,6 +128,25 @@ def validate_cfg(cfg: CFG) -> None:
             elif isinstance(op, EndLoan):
                 if not isinstance(op.loan_id, str) or op.loan_id == "":
                     raise CFGValidationError("loan_id 必须是非空字符串", f"{oloc}.loan_id")
+            elif isinstance(op, Reserve):
+                if not isinstance(op.reservation_id, str) or op.reservation_id == "":
+                    raise CFGValidationError(
+                        "reservation_id 必须是非空字符串", f"{oloc}.reservation_id")
+                if op.reservation_id in loan_site:
+                    raise CFGValidationError(
+                        f"标识 {op.reservation_id!r} 不唯一：loan_id 与 reservation_id "
+                        "共用命名空间，每个标识只能有一个 borrow/reserve 点",
+                        f"{oloc}.reservation_id",
+                    )
+                loan_site[op.reservation_id] = op
+                reservation_ids.add(op.reservation_id)
+                _check_path_shape(op.path, f"{oloc}.path")
+                op_path_users.append((bi, oi, op, op.path))
+            elif isinstance(op, Activate):
+                if not isinstance(op.reservation_id, str) or op.reservation_id == "":
+                    raise CFGValidationError(
+                        "reservation_id 必须是非空字符串", f"{oloc}.reservation_id")
+                activate_sites.append((bi, oi, op.reservation_id))
             else:  # pragma: no cover - 防御性分支
                 raise CFGValidationError(f"未知操作类型 {type(op).__name__}", oloc)
 
@@ -131,14 +155,20 @@ def validate_cfg(cfg: CFG) -> None:
         for ui, uop in block_path_ops:
             op_path_users.append((bi, ui, uop, uop.path))
 
-    # end_loan 引用的 loan 必须存在。
+    # end_loan 引用的 loan/预约必须存在；activate 引用的预约必须存在。
     for bi, block in enumerate(blocks):
         for oi, op in enumerate(block.ops):
             if isinstance(op, EndLoan) and op.loan_id not in loan_site:
                 raise CFGValidationError(
-                    f"end_loan 引用了不存在的 loan_id {op.loan_id!r}",
+                    f"end_loan 引用了不存在的 loan/预约标识 {op.loan_id!r}",
                     f"blocks[{bi}].ops[{oi}].loan_id",
                 )
+    for bi, oi, rid in activate_sites:
+        if rid not in reservation_ids:
+            raise CFGValidationError(
+                f"activate 引用了不存在的预约 {rid!r}",
+                f"blocks[{bi}].ops[{oi}].reservation_id",
+            )
 
     # 路径根变量与字段存在性。
     for bi, oi, op, path in op_path_users:

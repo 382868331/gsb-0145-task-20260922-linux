@@ -14,21 +14,29 @@
 ## 准确命令
 
 ```bash
-# 必要测试（51 个用例，含 400 个随机 DAG 与独立参考的对照）
+# 准备虚拟环境（仅首次；库本身零依赖，venv 只为隔离解释器）
+python3.14 -m venv .venv
+source .venv/bin/activate
+
+# 必要测试（72 个用例，含两组各 400 个随机 DAG 与独立参考的对照）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：一个 clean 的正常结果 + 实际触发的拒绝与异常边界
 python demo.py
+
+# reserve/activate 预约-激活演示：合法读取参数后激活 vs 激活前保留共享借用
+python demo_iteration.py
 ```
 
-demo 实测耗时约 1 毫秒（不使用 sleep、不使用预录结果，全部现场计算）。
+两个 demo 实测耗时均约 1 毫秒（不使用 sleep、不使用预录结果，全部现场计算）。
 
 ## 公开接口
 
 ```python
 from borrow_check import (
     CFG, Block,                       # 图
-    Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write,  # 七种操作
+    Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write,  # 普通操作
+    Reserve, Activate,                # 预约-激活
     cfg_from_dict, validate_cfg, check,
     CheckResult, Conflict, Witness,  # 结果
     CFGValidationError, BudgetExhaustedError,
@@ -55,17 +63,29 @@ from borrow_check import (
 | `end_loan(loan_id)` | 结束借用；loan_id 必须存在 |
 | `read(path)` | 路径不得可能已移动；不得有重叠的活跃可变借用（共享借用允许读） |
 | `write(path, reinit=False)` | 普通写不得与任何活跃借用重叠、路径不得可能已移动；`reinit=True` 为字段重组写 |
+| `reserve(reservation_id, path)` | 预约一次未来的可变借用：预约阶段等价共享借用（允许共享读取、与共享借用共存），与重叠的活跃**可变**借用或**已激活**预约冲突 |
+| `activate(reservation_id)` | 把仍存活的预约升级为独占借用：与重叠的**任何**活跃借用及其他存活预约冲突；且预约必须在**所有**到达路径上存活且未激活 |
 
 约定：
 
 * **每个 `loan_id` 静态唯一**，对应唯一 borrow 点，其模式（shared/mut）
   与固定路径在该点确定。
+* **每个 `reservation_id` 静态唯一**，与 loan_id 共用同一标识命名空间
+  （同一标识不能既是 loan 又是预约）。`end_loan` 可结束普通借用或
+  仍存活的预约；`activate` 与针对预约的 `end_loan` 只能操作
+  仍存活的那一次（重复激活、结束后激活、重复结束均报
+  `reservation_not_live`）。
+* **预约-激活两阶段语义**：`reserve` 先占位置（共享级），之后出现的
+  重叠可变借用仍报 `borrow_conflict`；`activate` 才真正升级为
+  独占。控制流汇合后，只有在**所有**到达路径上都预约成功且未结束时才
+  允许激活（must 判定，汇合取交集），不能因某条路可用就放行。
 * **移动父路径使所有子路径不可用**（方向性：祖先 → 子孙）。移动子路径
   **不**使父路径或兄弟字段不可用——不同字段可独立移动/借用。借用冲突
   使用的是**对称重叠**（祖先与子孙任一方借了都冲突）。两套关系刻意区分。
 * **重新赋值字段只恢复该字段**：`write(path, reinit=True)` 恢复 `path`
-  子树的可用性；若此前移动的是祖先路径，则祖先对象本身仍可能已移动
-  （记为“精确移动”，只压自身），通往 `path` 沿途的兄弟字段仍不可用。
+  子树的可用性；若此前移动的是祖先路径，则祖先及通往 `path` 沿途的
+  中间对象本身仍可能已移动（记为“精确移动”，只压自身），通往 `path`
+  沿途的兄弟字段仍不可用。
   普通 `write`（`reinit=False`）不恢复任何东西。
 
 ### check
@@ -78,12 +98,14 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
 * `result.conflicts: list[Conflict]`，按 `(块, 操作)` 有序；每个
   `Conflict` 含 `kind`、`block`、`op`、`op_name`、`path`、`detail`
   和 `witnesses: tuple[Witness, ...]`。
-* `Witness` 是前驱链：诞生点 `(origin_block, origin_op)`（move 或 borrow
-  操作）、作用路径/loan_id/模式、以及从诞生块到冲突块的 `block_chain`。
+* `Witness` 是前驱链：诞生点 `(origin_block, origin_op)`（move、borrow
+  或 reserve 操作）、作用路径/loan_id/模式、以及从诞生块到冲突块的
+  `block_chain`。
   见证链经过环时规范化为简单路径（may 分析下删环仍为合法见证），
   **不靠遍历深度截断**。
 * 冲突种类：`use_of_moved`、`move_while_borrowed`、`borrow_conflict`、
-  `read_while_mut_borrowed`、`write_while_borrowed`。
+  `read_while_mut_borrowed`、`write_while_borrowed`、`reserve_conflict`、
+  `activate_conflict`、`reservation_not_live`。
 * `result.iterations` 为到达不动点前的块处理次数。
 * `result.explain()` 渲染人类可读的冲突来源链（demo 使用）。
 
@@ -93,18 +115,27 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   * 可能已移动路径：**子树移动反链**（`move` 产生，压自身及子孙）+
     **精确移动集合**（只压自身，reinit 拆分祖先移动时产生）；
   * 可能仍活跃借用：`loan_id` 集合（may：分支并集，故包含“可能未结束”）。
-* 分支合并 = 两者并集；worklist 单调迭代到**不动点**（循环求不动点），
-  对任意含环 CFG 都终止，终止性不依赖递归深度或截断。
-* 变更判定建立在状态的**语义外延**（被压制路径集合 ∪ 活跃 loan）上；
-  可证明块处理次数上界为 `E·(P+L) + n`（E=边数，P=类型树路径数，
-  L=loan 数，n=块数）。`check` 对只读输入，失败不留部分变更。
+  * 预约：可能仍存活预约 + 可能已激活预约（may，并集）；以及
+    **所有**到达路径上都“存活且未激活”（`must_reserved`）与“存活
+    （不论是否已激活）”（`must_live`）的预约集合（must，汇合取交集）。
+    `activate` 要求标识 ∈ `must_reserved`，针对预约的 `end_loan`
+    要求 ∈ `must_live`。
+* 分支合并 = may 部分并集、must 部分交集；worklist 单调迭代到**不动点**
+  （循环求不动点），对任意含环 CFG 都终止，终止性不依赖递归深度或截断。
+* 变更判定建立在状态的**语义外延**（被压制路径集合 ∪ 活跃 loan ∪
+  存活/已激活预约 ∪ 两个 must 集合）上；可证明块处理次数上界为
+  `E·(P+L+4R) + n`（E=边数，P=类型树路径数，L=loan 数，R=预约数，
+  n=块数；may 部分只增、must 部分只减）。`check` 对只读输入，
+  失败不留部分变更。
 * 冲突在不动点上做一次有序终扫描权威收集，故结果与 worklist 调度次序无关。
 
 ## 输入上限（接口边界）
 
 * 块数：**1..50**；单块操作数：≤ 10 000；
 * 记录树节点总数：≤ 100 000；
-* 路径段、变量名、loan_id：非空字符串；每个 loan_id 仅一个 borrow 点；
+* 路径段、变量名、loan_id、reservation_id：非空字符串；每个 loan_id 仅
+  一个 borrow 点，每个 reservation_id 仅一个 reserve 点，两类标识共用
+  同一命名空间；
 * 后继下标必须在范围内、不可重复；`entry` 必须合法。
 
 ## 错误语义
@@ -137,12 +168,22 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   实现**：类型树全路径位向量 + DAG 全块序列枚举解释。该参考**不 import
   被测核心**，与核心的反链不动点是两条独立实现路线；两者的冲突集合
   `(kind, block, op)` 必须逐例一致。
+* `tests/test_reserve.py`：预约-激活验收场景（读取参数后激活、激活前
+  保留共享借用被拒、预约跨分支、重复激活、结束后激活、父/子字段重叠、
+  循环回边重复激活 + 预算分离）与非法输入定位，期望值按契约手写。
+* `tests/test_reserve_dag_reference.py`：固定种子（20260926）确定性生成
+  400 个含 reserve/activate 的小型 DAG，对照扩展后的独立参考（逐路径
+  维护预约状态机：reserved/activated/已结束），覆盖预约跨分支、重复
+  激活、父/子字段重叠；冲突集合仍须逐例一致。
 * `tests/test_validation.py`：非法输入定位、数值守卫、预算/无冲突分离。
 
 ## 设计取舍
 
 * may 语义（可能已移动 / 可能仍活跃取并集）：宁可误报也要保证健全，
   与题面“合并取并集”一致；不做 must 分析或路径条件精化。
+  例外：预约的`activate`/`end_loan` 存活判定是题面要求的 **must**
+  分析（“所有到达路径都预约成功且未结束”），仅限预约状态机，不推广
+  到普通借用。
 * `declare` 要求在 CFG 上支配使用点（经典支配集不动点判定），避免在
   “声明可能尚未执行”的状态上分析；不可达块豁免。
 * 字段重组用“精确移动 + 兄弟子树移动”拆分祖先移动，严格实现
@@ -158,6 +199,10 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   上的字段投影，不模拟原始指针/索引/数组元素。
 * 块是扁平操作序列，不建模表达式树；一次操作只作用于一个固定路径。
 * `end_loan` 是词法操作，不推断隐式结束点（NLL）。
+* 预约是普通借用之外的两阶段机制：`reserve` 共享级、`activate` 升级为
+  独占；没有“隐式激活”或基于使用点的自动升级（非 NLL 风格）。循环内
+  重复 `activate` 同一预约会在回边上被拒（第二次激活时预约已激活），
+  需要重新 `reserve`。
 * may 分析会报告真实编译器可能接受的分支组合（例如互斥分支分别移动不同
   字段后按并集处理），这是题面指定并集语义的直接结果。
 
@@ -169,5 +214,6 @@ borrow_check/model.py      # 数据结构、dict->CFG 构造与结构校验
 borrow_check/validator.py  # 语义校验（含支配集不动点）
 borrow_check/analyzer.py   # 核心：反链+精确移动、worklist 不动点、见证
 demo.py                    # 固定输入演示
+demo_iteration.py          # reserve/activate 预约-激活演示
 tests/                     # 必要测试 + 独立参考实现
 ```

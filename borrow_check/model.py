@@ -15,8 +15,11 @@
 操作
 ====
 每个块含一个有序操作列表，操作类型为：``declare``、``move``、
-``borrow_shared``、``borrow_mut``、``end_loan``、``read``、``write``。
+``borrow_shared``、``borrow_mut``、``end_loan``、``read``、``write``、
+``reserve``、``activate``。
 每个 loan_id 静态唯一、作用于固定路径（在唯一的 borrow 处确定）。
+每个 reservation_id 同样静态唯一（在唯一的 reserve 处确定），与 loan_id
+共用一个标识命名空间；``end_loan`` 可结束普通借用或预约。
 """
 
 from __future__ import annotations
@@ -91,7 +94,30 @@ class Write:
     reinit: bool = False
 
 
-Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write]
+@dataclass(frozen=True)
+class Reserve:
+    """reserve：预约一次未来的可变借用。
+
+    预约阶段该路径允许共享读取（与共享借用一样只排斥可变借用）；
+    预约之后出现的重叠可变借用仍报冲突。
+    """
+
+    reservation_id: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class Activate:
+    """activate：把仍存活的预约升级为独占（可变）借用。
+
+    只有在**所有**到达路径上该预约都成功且未结束/未激活时才合法。
+    """
+
+    reservation_id: str
+
+
+Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write,
+                  Reserve, Activate]
 
 _OP_KINDS = {
     "declare": Decl,
@@ -101,6 +127,8 @@ _OP_KINDS = {
     "end_loan": EndLoan,
     "read": Read,
     "write": Write,
+    "reserve": Reserve,
+    "activate": Activate,
 }
 
 
@@ -202,6 +230,21 @@ def operation_from_dict(data: object, loc: str) -> Operation:
             if not _is_ident(loan_id):
                 raise CFGValidationError("loan_id 必须是非空字符串", f"{loc}.loan_id")
             return EndLoan(loan_id=loan_id)
+        if kind == "reserve":
+            _require_keys(data, frozenset({"op", "reservation_id", "path"}), loc)
+            reservation_id = data.get("reservation_id")
+            if not _is_ident(reservation_id):
+                raise CFGValidationError(
+                    "reservation_id 必须是非空字符串", f"{loc}.reservation_id")
+            path = _validate_path(data.get("path"), f"{loc}.path")
+            return Reserve(reservation_id=reservation_id, path=path)  # type: ignore[arg-type]
+        if kind == "activate":
+            _require_keys(data, frozenset({"op", "reservation_id"}), loc)
+            reservation_id = data.get("reservation_id")
+            if not _is_ident(reservation_id):
+                raise CFGValidationError(
+                    "reservation_id 必须是非空字符串", f"{loc}.reservation_id")
+            return Activate(reservation_id=reservation_id)  # type: ignore[arg-type]
         # write
         _require_keys(data, frozenset({"op", "path", "reinit"}), loc)
         path = _validate_path(data.get("path"), f"{loc}.path")

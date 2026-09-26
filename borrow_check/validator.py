@@ -7,7 +7,8 @@
 根变量恰好 declare 一次；declare 必须在 CFG 上**支配**每个使用点
 （块内要求操作下标不早于声明，跨块要求声明块支配使用块；不可达块豁免）；
 所有路径在记录树中存在；loan_id 全局唯一对应一个 borrow，
-end_loan 必须引用已存在的 loan。
+end_loan 必须引用已存在的 loan；reserve_id 全局唯一对应一个 reserve，
+activate/end_reserve 必须引用已存在的 reserve。
 """
 
 from __future__ import annotations
@@ -17,16 +18,19 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 from .errors import CFGValidationError, checked_int
 from .model import (
+    Activate,
     Block,
     BorrowMut,
     BorrowShared,
     CFG,
     Decl,
     EndLoan,
+    EndReserve,
     Move,
     Operation,
     Path,
     Read,
+    Reserve,
     Write,
 )
 
@@ -72,6 +76,7 @@ def validate_cfg(cfg: CFG) -> None:
     declared: Dict[str, Decl] = {}
     decl_site: Dict[str, Tuple[int, int]] = {}
     loan_site: Dict[str, Operation] = {}
+    reserve_site: Dict[str, Operation] = {}
     op_path_users: List[Tuple[int, int, Operation, Path]] = []
     type_node_counter = [0]
 
@@ -123,6 +128,22 @@ def validate_cfg(cfg: CFG) -> None:
             elif isinstance(op, EndLoan):
                 if not isinstance(op.loan_id, str) or op.loan_id == "":
                     raise CFGValidationError("loan_id 必须是非空字符串", f"{oloc}.loan_id")
+            elif isinstance(op, Reserve):
+                if not isinstance(op.reserve_id, str) or op.reserve_id == "":
+                    raise CFGValidationError(
+                        "reserve_id 必须是非空字符串", f"{oloc}.reserve_id")
+                if op.reserve_id in reserve_site:
+                    raise CFGValidationError(
+                        f"reserve_id {op.reserve_id!r} 不唯一：每个 reserve_id 只能有一个 reserve 点",
+                        f"{oloc}.reserve_id",
+                    )
+                reserve_site[op.reserve_id] = op
+                _check_path_shape(op.path, f"{oloc}.path")
+                op_path_users.append((bi, oi, op, op.path))
+            elif isinstance(op, (Activate, EndReserve)):
+                if not isinstance(op.reserve_id, str) or op.reserve_id == "":
+                    raise CFGValidationError(
+                        "reserve_id 必须是非空字符串", f"{oloc}.reserve_id")
             else:  # pragma: no cover - 防御性分支
                 raise CFGValidationError(f"未知操作类型 {type(op).__name__}", oloc)
 
@@ -138,6 +159,11 @@ def validate_cfg(cfg: CFG) -> None:
                 raise CFGValidationError(
                     f"end_loan 引用了不存在的 loan_id {op.loan_id!r}",
                     f"blocks[{bi}].ops[{oi}].loan_id",
+                )
+            if isinstance(op, (Activate, EndReserve)) and op.reserve_id not in reserve_site:
+                raise CFGValidationError(
+                    f"{type(op).__name__} 引用了不存在的 reserve_id {op.reserve_id!r}",
+                    f"blocks[{bi}].ops[{oi}].reserve_id",
                 )
 
     # 路径根变量与字段存在性。

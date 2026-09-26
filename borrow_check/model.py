@@ -15,8 +15,11 @@
 操作
 ====
 每个块含一个有序操作列表，操作类型为：``declare``、``move``、
-``borrow_shared``、``borrow_mut``、``end_loan``、``read``、``write``。
-每个 loan_id 静态唯一、作用于固定路径（在唯一的 borrow 处确定）。
+``borrow_shared``、``borrow_mut``、``end_loan``、``read``、``write``，
+以及预约式借用的 ``reserve``、``activate``、``end_reserve``。
+每个 loan_id 静态唯一、作用于固定路径（在唯一的 borrow 处确定）；
+每个 reserve_id 同样静态唯一（唯一的 reserve 点确定其路径），
+``activate``/``end_reserve`` 只能作用于仍存活的预约。
 """
 
 from __future__ import annotations
@@ -72,6 +75,36 @@ class EndLoan:
 
 
 @dataclass(frozen=True)
+class Reserve:
+    """reserve：在 path 上预约一次可变借用（预约阶段允许共享读取）。
+
+    预约相当于一个共享占用：与重叠的活跃可变借用/已激活预约冲突，
+    但不阻止读取与其他共享借用；预约之后出现的重叠可变借用仍报冲突。
+    """
+
+    reserve_id: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class Activate:
+    """activate：把仍存活的预约升级为独占借用。
+
+    只在**所有**到达路径都预约成功且未结束（must）时允许；
+    升级时若仍有重叠的活跃借用/预约（如保留的共享借用）则拒绝。
+    """
+
+    reserve_id: str
+
+
+@dataclass(frozen=True)
+class EndReserve:
+    """end_reserve：结束预约（未激活）或激活后的独占借用。"""
+
+    reserve_id: str
+
+
+@dataclass(frozen=True)
 class Read:
     """read：读取路径。路径不得可能已移动，且不得与活跃可变借用冲突。"""
 
@@ -91,7 +124,8 @@ class Write:
     reinit: bool = False
 
 
-Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write]
+Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan,
+                  Reserve, Activate, EndReserve, Read, Write]
 
 _OP_KINDS = {
     "declare": Decl,
@@ -99,6 +133,9 @@ _OP_KINDS = {
     "borrow_shared": BorrowShared,
     "borrow_mut": BorrowMut,
     "end_loan": EndLoan,
+    "reserve": Reserve,
+    "activate": Activate,
+    "end_reserve": EndReserve,
     "read": Read,
     "write": Write,
 }
@@ -202,6 +239,22 @@ def operation_from_dict(data: object, loc: str) -> Operation:
             if not _is_ident(loan_id):
                 raise CFGValidationError("loan_id 必须是非空字符串", f"{loc}.loan_id")
             return EndLoan(loan_id=loan_id)
+        if kind == "reserve":
+            _require_keys(data, frozenset({"op", "reserve_id", "path"}), loc)
+            reserve_id = data.get("reserve_id")
+            if not _is_ident(reserve_id):
+                raise CFGValidationError(
+                    "reserve_id 必须是非空字符串", f"{loc}.reserve_id")
+            path = _validate_path(data.get("path"), f"{loc}.path")
+            return Reserve(reserve_id=reserve_id, path=path)
+        if kind in ("activate", "end_reserve"):
+            _require_keys(data, frozenset({"op", "reserve_id"}), loc)
+            reserve_id = data.get("reserve_id")
+            if not _is_ident(reserve_id):
+                raise CFGValidationError(
+                    "reserve_id 必须是非空字符串", f"{loc}.reserve_id")
+            cls = Activate if kind == "activate" else EndReserve
+            return cls(reserve_id=reserve_id)
         # write
         _require_keys(data, frozenset({"op", "path", "reinit"}), loc)
         path = _validate_path(data.get("path"), f"{loc}.path")

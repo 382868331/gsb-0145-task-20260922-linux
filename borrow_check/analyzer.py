@@ -13,6 +13,14 @@
   ``q``。方向性：移动子路径不使父路径不可用（不同字段独立）。
 * ``loans``：可能仍活跃的 loan_id 集合（每个 id 的模式与路径在唯一 borrow 点固定）。
   借用冲突使用**对称重叠**（互为前缀即冲突），与移动可用性的方向规则区分。
+* 预约式借用（``reserve``/``activate``/``end_reserve``）：
+
+  - ``reserved``/``activated``：may 集合。预约中的 id 相当于共享占用
+    （允许读取与共享借用，拒绝重叠的可变借用/移动/写入）；已激活的 id
+    相当于独占（可变）借用。冲突报告用 may 语义（并集合并）。
+  - ``reserved_must``/``activated_must``：must 集合（交汇合并取交集）。
+    ``activate``/``end_reserve`` 只能作用于**所有**到达路径上都仍存活的
+    预约，不能因为某条路可用就放行。
 
 分支合并 = 两者的并集（可能已移动 / 可能仍活跃），传输函数关于入口状态
 的语义外延单调（reinit 的 kill 集合只依赖操作本身，不依赖入口状态），
@@ -29,16 +37,19 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .errors import BudgetExhaustedError
 from .model import (
+    Activate,
     BorrowMut,
     BorrowShared,
     CFG,
     Decl,
     EndLoan,
+    EndReserve,
     Move,
     Operation,
     Path,
     Read,
     RecordNode,
+    Reserve,
     Write,
 )
 
@@ -74,7 +85,9 @@ class Conflict:
 
     :param kind: 冲突种类（见模块文档与 README）：
         ``use_of_moved`` / ``move_while_borrowed`` / ``borrow_conflict`` /
-        ``read_while_mut_borrowed`` / ``write_while_borrowed``。
+        ``read_while_mut_borrowed`` / ``write_while_borrowed``，以及预约式
+        借用的 ``reserve_conflict`` / ``activate_not_live`` /
+        ``activate_conflict`` / ``end_not_live``。
     :param block / op: 冲突操作位置。
     :param witnesses: 导致冲突的前驱见证（可能多条，如同时可能已移动
         且存在活跃可变借用）。
@@ -121,9 +134,22 @@ class _State:
     moved_exact: Dict[Path, Witness] = field(default_factory=dict)
     # loans: loan_id -> 见证。
     loans: Dict[str, Witness] = field(default_factory=dict)
+    # 预约（may）：reserve_id -> 见证。reserved=共享占用，activated=独占。
+    reserved: Dict[str, Witness] = field(default_factory=dict)
+    activated: Dict[str, Witness] = field(default_factory=dict)
+    # 预约（must）：所有到达路径上都处于该状态的 reserve_id。
+    reserved_must: set = field(default_factory=set)
+    activated_must: set = field(default_factory=set)
+    # 预约（must）：所有到达路径上都仍存活（reserved 或 activated）。
+    alive_must: set = field(default_factory=set)
 
     def copy(self) -> "_State":
-        return _State(dict(self.moved_subtree), dict(self.moved_exact), dict(self.loans))
+        return _State(
+            dict(self.moved_subtree), dict(self.moved_exact), dict(self.loans),
+            dict(self.reserved), dict(self.activated),
+            set(self.reserved_must), set(self.activated_must),
+            set(self.alive_must),
+        )
 
 
 def _is_prefix(a: Path, b: Path) -> bool:
@@ -203,17 +229,26 @@ class _LoanInfo:
     path: Path
 
 
+@dataclass
+class _ReserveInfo:
+    block: int
+    op: int
+    path: Path
+
+
 class _Transfer:
     def __init__(
         self,
         cfg: CFG,
         types: Dict[str, RecordNode],
         loan_info: Dict[str, _LoanInfo],
+        reserve_info: Dict[str, _ReserveInfo],
         collect: bool,
     ) -> None:
         self.cfg = cfg
         self.types = types
         self.loan_info = loan_info
+        self.reserve_info = reserve_info
         self.collect = collect
         self.conflicts: List[Conflict] = []
 
@@ -320,14 +355,27 @@ class _Transfer:
         return sorted(hits)
 
     def _overlapping_loans(self, st: _State, path: Path,
-                           *, mut_only: bool = False) -> List[Tuple[str, Witness]]:
+                           *, mut_only: bool = False
+                           ) -> List[Tuple[str, Witness, str, Path]]:
+        """与 path 重叠的活跃占用（普通借用 + 预约），返回 (id, 见证, 模式, 路径)。
+
+        预约中的 reservation 按共享（shared）处理，已激活的按可变（mut）处理。
+        """
         out = []
         for lid, w in st.loans.items():
             info = self.loan_info[lid]
             if _overlaps(info.path, path):
                 if mut_only and info.mode != "mut":
                     continue
-                out.append((lid, w))
+                out.append((lid, w, info.mode, info.path))
+        for rid, w in st.reserved.items():
+            rpath = self.reserve_info[rid].path
+            if _overlaps(rpath, path) and not mut_only:
+                out.append((rid, w, "shared", rpath))
+        for rid, w in st.activated.items():
+            rpath = self.reserve_info[rid].path
+            if _overlaps(rpath, path):
+                out.append((rid, w, "mut", rpath))
         out.sort(key=lambda x: x[0])
         return out
 
@@ -351,7 +399,7 @@ class _Transfer:
                     "use_of_moved", bi, oi, "move", op.path,
                     f"move 的路径 {_fmt(op.path)} 可能已被移动", [w])
             loan_hits = self._overlapping_loans(st, op.path)
-            for _, w in loan_hits:
+            for _, w, _, _ in loan_hits:
                 self._conflict(
                     "move_while_borrowed", bi, oi, "move", op.path,
                     f"move 的路径 {_fmt(op.path)} 与活跃借用重叠", [w])
@@ -366,12 +414,11 @@ class _Transfer:
                     f"借用路径 {_fmt(op.path)} 可能已被移动", [w])
             mut_only = mode == "shared"  # shared 只与 mut 冲突；mut 与任何 loan 冲突
             hits = self._overlapping_loans(st, op.path, mut_only=mut_only)
-            for lid, w in hits:
-                other_mode = self.loan_info[lid].mode
+            for lid, w, other_mode, other_path in hits:
                 self._conflict(
                     "borrow_conflict", bi, oi, f"borrow_{mode}", op.path,
                     f"{mode} 借用 {_fmt(op.path)} 与活跃{('可变' if other_mode == 'mut' else '共享')}"
-                    f"借用 {lid}@{_fmt(self.loan_info[lid].path)} 重叠", [w])
+                    f"占用 {lid}@{_fmt(other_path)} 重叠", [w])
             st.loans[op.loan_id] = self._born(
                 "loan", bi, oi, op.path, loan_id=op.loan_id, mode=mode)
             return
@@ -380,19 +427,87 @@ class _Transfer:
             st.loans.pop(op.loan_id, None)
             return
 
+        if isinstance(op, Reserve):
+            for _, w in self._disabled_by_move(st, op.path):
+                self._conflict(
+                    "use_of_moved", bi, oi, "reserve", op.path,
+                    f"预约路径 {_fmt(op.path)} 可能已被移动", [w])
+            # 预约是共享占用：只与可变占用（mut loan / 已激活预约）冲突。
+            for lid, w, _, _ in self._overlapping_loans(st, op.path, mut_only=True):
+                self._conflict(
+                    "reserve_conflict", bi, oi, "reserve", op.path,
+                    f"预约 {_fmt(op.path)} 与活跃可变占用 {lid} 重叠", [w])
+            st.reserved[op.reserve_id] = self._born(
+                "reservation", bi, oi, op.path,
+                loan_id=op.reserve_id, mode="reserved")
+            st.activated.pop(op.reserve_id, None)
+            st.reserved_must.add(op.reserve_id)
+            st.activated_must.discard(op.reserve_id)
+            st.alive_must.add(op.reserve_id)
+            return
+
+        if isinstance(op, Activate):
+            rid = op.reserve_id
+            if rid not in st.reserved_must:
+                # 存在未预约/已结束/已激活的到达路径：must 不满足即拒绝，
+                # 不能因为某条路可用就放行。
+                wit = [st.reserved[rid]] if rid in st.reserved else []
+                self._conflict(
+                    "activate_not_live", bi, oi, "activate", None,
+                    f"activate {rid}：并非所有到达路径都预约成功且未结束"
+                    f"（可能未预约、已结束或已激活）", wit)
+                return
+            rpath = self.reserve_info[rid].path
+            # 升级为独占：与任何重叠的活跃占用冲突（保留的共享借用也拒绝）。
+            for lid, w, other_mode, other_path in self._overlapping_loans(st, rpath):
+                if lid == rid:
+                    continue
+                self._conflict(
+                    "activate_conflict", bi, oi, "activate", rpath,
+                    f"activate {rid}@{_fmt(rpath)} 与活跃"
+                    f"{('可变' if other_mode == 'mut' else '共享')}"
+                    f"占用 {lid}@{_fmt(other_path)} 重叠", [w])
+            # 即使冲突也按声明的效果升级（错误恢复，见 README 设计取舍）。
+            st.reserved.pop(rid, None)
+            st.activated[rid] = self._born(
+                "reservation", bi, oi, rpath, loan_id=rid, mode="activated")
+            st.reserved_must.discard(rid)
+            st.activated_must.add(rid)
+            return
+
+        if isinstance(op, EndReserve):
+            rid = op.reserve_id
+            if rid not in st.alive_must:
+                wit = []
+                if rid in st.reserved:
+                    wit = [st.reserved[rid]]
+                elif rid in st.activated:
+                    wit = [st.activated[rid]]
+                self._conflict(
+                    "end_not_live", bi, oi, "end_reserve", None,
+                    f"end_reserve {rid}：预约并非在所有到达路径上都仍存活"
+                    f"（可能未预约或已结束）", wit)
+                return
+            st.reserved.pop(rid, None)
+            st.activated.pop(rid, None)
+            st.reserved_must.discard(rid)
+            st.activated_must.discard(rid)
+            st.alive_must.discard(rid)
+            return
+
         if isinstance(op, Read):
             for _, w in self._disabled_by_move(st, op.path):
                 self._conflict(
                     "use_of_moved", bi, oi, "read", op.path,
                     f"读取的路径 {_fmt(op.path)} 可能已被移动", [w])
-            for _, w in self._overlapping_loans(st, op.path, mut_only=True):
+            for _, w, _, _ in self._overlapping_loans(st, op.path, mut_only=True):
                 self._conflict(
                     "read_while_mut_borrowed", bi, oi, "read", op.path,
                     f"读取 {_fmt(op.path)} 时存在重叠的活跃可变借用", [w])
             return
 
         if isinstance(op, Write):
-            for _, w in self._overlapping_loans(st, op.path):
+            for _, w, _, _ in self._overlapping_loans(st, op.path):
                 self._conflict(
                     "write_while_borrowed", bi, oi, "write", op.path,
                     f"写入 {_fmt(op.path)} 时存在重叠的活跃借用", [w])
@@ -426,12 +541,17 @@ def _lift(state: _State, succ_block: int) -> _State:
     lifted = _State()
     for src, dst in ((state.moved_subtree, lifted.moved_subtree),
                      (state.moved_exact, lifted.moved_exact),
-                     (state.loans, lifted.loans)):
+                     (state.loans, lifted.loans),
+                     (state.reserved, lifted.reserved),
+                     (state.activated, lifted.activated)):
         for key, w in src.items():
             dst[key] = Witness(
                 kind=w.kind, origin_block=w.origin_block, origin_op=w.origin_op,
                 block_chain=extend(w.block_chain, succ_block),
                 path=w.path, loan_id=w.loan_id, mode=w.mode)
+    lifted.reserved_must = set(state.reserved_must)
+    lifted.activated_must = set(state.activated_must)
+    lifted.alive_must = set(state.alive_must)
     return lifted
 
 
@@ -453,6 +573,19 @@ def _join(into: _State, other: _State) -> bool:
         if lid not in into.loans:
             into.loans[lid] = w
             grown = True
+    for rid, w in other.reserved.items():
+        if rid not in into.reserved:
+            into.reserved[rid] = w
+            grown = True
+    for rid, w in other.activated.items():
+        if rid not in into.activated:
+            into.activated[rid] = w
+            grown = True
+    # 预约存活性是 must 语义：交汇取交集（into 必先以某条前驱初始化，
+    # 见 check.process；空 _State 的 must 集合为空，交集天然安全）。
+    into.reserved_must &= other.reserved_must
+    into.activated_must &= other.activated_must
+    into.alive_must &= other.alive_must
     return grown
 
 
@@ -465,10 +598,11 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
     """对 CFG 运行字段敏感静态借用检查。
 
     :param cfg: 已通过结构构造的 :class:`CFG`（``check`` 会先做完整语义校验）。
-    :param max_iterations: 块处理预算。默认取可证明上界
-        ``n * (P + L) + n``（n 块数、P 类型树路径数、L loan 数），
-        合法 CFG 不可能耗尽。传入更小的正数可在测试中演示
-        :class:`BudgetExhaustedError` 与“无冲突”结论的区别。
+    :param max_iterations: 块处理预算。默认取上界
+        ``E * (P + L) + n``（E 边数、P 类型树路径数、L 借用+预约数、n 块数）；
+        不含预约的 CFG 上该上界可证明、合法输入不可能耗尽；含预约时
+        must 分量不在证明内（见 README「已知限制」）。传入更小的正数
+        可在测试中演示 :class:`BudgetExhaustedError` 与“无冲突”结论的区别。
     :raises CFGValidationError: 非法输入（携带 location）。
     :raises BudgetExhaustedError: 搜索预算耗尽。
     """
@@ -483,6 +617,7 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
     n = len(cfg.blocks)
     types: Dict[str, RecordNode] = {}
     loan_info: Dict[str, _LoanInfo] = {}
+    reserve_info: Dict[str, _ReserveInfo] = {}
     for bi, block in enumerate(cfg.blocks):
         for oi, op in enumerate(block.ops):
             if isinstance(op, Decl):
@@ -490,9 +625,14 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
             elif isinstance(op, (BorrowShared, BorrowMut)):
                 mode = "mut" if isinstance(op, BorrowMut) else "shared"
                 loan_info[op.loan_id] = _LoanInfo(bi, oi, mode, op.path)
+            elif isinstance(op, Reserve):
+                reserve_info[op.reserve_id] = _ReserveInfo(bi, oi, op.path)
 
     p_count = len(all_type_paths(types))
-    l_count = len(loan_info)
+    # 预约与借用一样占用 may 集合外延；must 分量（交汇取交集）不在
+    # 原可证明上界内——含预约的循环 CFG 上该预算不再是被证明的上界，
+    # 见 README「已知限制」。
+    l_count = len(loan_info) + len(reserve_info)
     universe = all_type_paths(types)
     edge_count = sum(len(s) for s in cfg.successors)
     # 单调 worklist 的可证步数上界：每块出口外延至多严格增长 P+L 次；
@@ -520,13 +660,21 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
         if iterations > budget:
             raise BudgetExhaustedError(
                 f"不动点搜索预算耗尽：已处理 {budget} 个块次仍未收敛"
-                f"（可证明上界为 {bound}）。这不是“无冲突”证明。")
-        merged = _State()
+                f"（预算上界为 {bound}；含预约时该上界未被证明）。这不是“无冲突”证明。")
+        merged: Optional[_State] = None
         for p in predecessors[idx]:
             if p in outs:
-                _join(merged, _lift(outs[p], idx))
+                lifted = _lift(outs[p], idx)
+                if merged is None:
+                    # 第一个前驱直接作为初值：must 集合（交集合并）
+                    # 不能从空 _State 出发，否则永远交成空集。
+                    merged = lifted
+                else:
+                    _join(merged, lifted)
+        if merged is None:
+            merged = _State()
         ins[idx] = merged
-        transfer = _Transfer(cfg, types, loan_info, collect=False)
+        transfer = _Transfer(cfg, types, loan_info, reserve_info, collect=False)
         new_out = transfer.run_block(idx, merged)
         new_denot = _denotation(new_out, universe)
         changed = idx not in out_denot or out_denot[idx] != new_denot
@@ -550,19 +698,23 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
     # 不动点已到：用最终入口状态做一次有序扫描，权威地收集冲突与见证。
     conflicts: List[Conflict] = []
     for bi in range(n):
-        transfer = _Transfer(cfg, types, loan_info, collect=True)
+        transfer = _Transfer(cfg, types, loan_info, reserve_info, collect=True)
         transfer.run_block(bi, ins[bi])
         conflicts.extend(transfer.conflicts)
 
     return CheckResult(clean=not conflicts, conflicts=conflicts, iterations=iterations)
 
 
-def _denotation(st: _State, universe: List[Path]) -> Tuple[frozenset[Path], frozenset[str]]:
+def _denotation(st: _State, universe: List[Path]):
     """抽象状态的语义外延：被压制的全部类型路径 + 活跃 loan 集合。
 
     传输函数在外延包含序下单调（反链键集合本身不单调：祖先移动会替换
     子孙键，但其覆盖集合只增不减）。worklist 的变更判定与步数上界都
     建立在外延上。
+
+    预约带来两个 may 分量（reserved/activated，单调增长）与两个 must
+    分量（交汇时缩小）：外延仍有限，变更检测对任意分量生效，不动点
+    必达；但原「只增不减」的步数上界证明不再覆盖 must 分量。
     """
     covered: set[Path] = set()
     for m in st.moved_subtree:
@@ -571,7 +723,15 @@ def _denotation(st: _State, universe: List[Path]) -> Tuple[frozenset[Path], froz
                 covered.add(q)
     for q in st.moved_exact:  # 精确移动：只压制自身（q 必为类型树路径）
         covered.add(q)
-    return frozenset(covered), frozenset(st.loans)
+    return (
+        frozenset(covered),
+        frozenset(st.loans),
+        frozenset(st.reserved),
+        frozenset(st.activated),
+        frozenset(st.reserved_must),
+        frozenset(st.activated_must),
+        frozenset(st.alive_must),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -587,6 +747,10 @@ def _render_conflict(c: Conflict) -> str:
         if w.kind == "moved":
             origin = (f"move {_fmt(w.path)} 诞生于 "
                       f"blocks[{w.origin_block}].ops[{w.origin_op}]")
+        elif w.kind == "reservation":
+            what = "预约" if w.mode == "reserved" else "激活（独占化）"
+            origin = (f"{what} {w.loan_id}@{_fmt(w.path)} 发生于 "
+                      f"blocks[{w.origin_block}].ops[{w.origin_op}]，之后未被 end_reserve")
         else:
             origin = (f"{w.mode} 借用 {w.loan_id}@{_fmt(w.path)} 开始于 "
                       f"blocks[{w.origin_block}].ops[{w.origin_op}]，之后未被 end_loan")

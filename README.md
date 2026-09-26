@@ -14,21 +14,30 @@
 ## 准确命令
 
 ```bash
-# 必要测试（51 个用例，含 400 个随机 DAG 与独立参考的对照）
+# 可选：准备 venv（不安装任何第三方依赖，仅为隔离解释器）
+python3 -m venv .venv
+. .venv/bin/activate
+
+# 必要测试（78 个用例，含 400 个随机 DAG 与独立参考的对照）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：一个 clean 的正常结果 + 实际触发的拒绝与异常边界
 python demo.py
+
+# 预约式借用（reserve/activate）演示：合法激活 vs 激活前保留共享借用
+python demo_iteration.py
 ```
 
-demo 实测耗时约 1 毫秒（不使用 sleep、不使用预录结果，全部现场计算）。
+两个 demo 实测耗时均约 1 毫秒（不使用 sleep、不使用预录结果，
+全部现场计算），远小于 90 秒演示预算。
 
 ## 公开接口
 
 ```python
 from borrow_check import (
     CFG, Block,                       # 图
-    Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write,  # 七种操作
+    Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write,  # 普通操作
+    Reserve, Activate, EndReserve,    # 预约式借用
     cfg_from_dict, validate_cfg, check,
     CheckResult, Conflict, Witness,  # 结果
     CFGValidationError, BudgetExhaustedError,
@@ -55,11 +64,19 @@ from borrow_check import (
 | `end_loan(loan_id)` | 结束借用；loan_id 必须存在 |
 | `read(path)` | 路径不得可能已移动；不得有重叠的活跃可变借用（共享借用允许读） |
 | `write(path, reinit=False)` | 普通写不得与任何活跃借用重叠、路径不得可能已移动；`reinit=True` 为字段重组写 |
+| `reserve(reserve_id, path)` | 预约一次可变借用：相当于共享占用——允许重叠的读取与共享借用，但与重叠的活跃**可变**占用（mut 借用/已激活预约）冲突（`reserve_conflict`）；路径可能已移动时报 `use_of_moved` |
+| `activate(reserve_id)` | 把仍存活的预约升级为**独占**借用：只在**所有**到达路径都预约成功且未结束（must）时允许，否则 `activate_not_live`；升级时与任何重叠活跃占用（含保留的共享借用）冲突（`activate_conflict`） |
+| `end_reserve(reserve_id)` | 结束预约（或激活后的独占借用）；预约并非在所有到达路径上都存活时报 `end_not_live` |
 
 约定：
 
 * **每个 `loan_id` 静态唯一**，对应唯一 borrow 点，其模式（shared/mut）
   与固定路径在该点确定。
+* **每个 `reserve_id` 静态唯一**，对应唯一 reserve 点，其路径在该点确定；
+  `activate`/`end_reserve` 只能操作仍存活的那一次预约（重复激活、
+  结束后再操作都会被拒绝）。预约之后出现的冲突可变借用仍按
+  `borrow_conflict` 报出；字段重叠沿用对称前缀规则（父字段与子字段
+  重叠同样冲突）。
 * **移动父路径使所有子路径不可用**（方向性：祖先 → 子孙）。移动子路径
   **不**使父路径或兄弟字段不可用——不同字段可独立移动/借用。借用冲突
   使用的是**对称重叠**（祖先与子孙任一方借了都冲突）。两套关系刻意区分。
@@ -83,7 +100,9 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   见证链经过环时规范化为简单路径（may 分析下删环仍为合法见证），
   **不靠遍历深度截断**。
 * 冲突种类：`use_of_moved`、`move_while_borrowed`、`borrow_conflict`、
-  `read_while_mut_borrowed`、`write_while_borrowed`。
+  `read_while_mut_borrowed`、`write_while_borrowed`，以及预约式借用的
+  `reserve_conflict`、`activate_not_live`、`activate_conflict`、
+  `end_not_live`。
 * `result.iterations` 为到达不动点前的块处理次数。
 * `result.explain()` 渲染人类可读的冲突来源链（demo 使用）。
 
@@ -92,12 +111,19 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
 * 每块入口/出口各维护一个抽象状态：
   * 可能已移动路径：**子树移动反链**（`move` 产生，压自身及子孙）+
     **精确移动集合**（只压自身，reinit 拆分祖先移动时产生）；
-  * 可能仍活跃借用：`loan_id` 集合（may：分支并集，故包含“可能未结束”）。
+* 可能仍活跃借用：`loan_id` 集合（may：分支并集，故包含“可能未结束”）。
+* 预约状态四个分量：`reserved`/`activated`（may，分支并集；
+  预约中按共享占用、已激活按独占处理）与 `reserved_must`/`alive_must`
+  （must，分支**交集**）。`activate` 要求 `reserved_must`，
+  `end_reserve` 要求 `alive_must`——汇合后只在所有到达路径都预约成功
+  且未结束时才允许激活，不能因为某条路可用就放行。
 * 分支合并 = 两者并集；worklist 单调迭代到**不动点**（循环求不动点），
   对任意含环 CFG 都终止，终止性不依赖递归深度或截断。
-* 变更判定建立在状态的**语义外延**（被压制路径集合 ∪ 活跃 loan）上；
-  可证明块处理次数上界为 `E·(P+L) + n`（E=边数，P=类型树路径数，
-  L=loan 数，n=块数）。`check` 对只读输入，失败不留部分变更。
+* 变更判定建立在状态的**语义外延**（被压制路径集合 ∪ 活跃 loan ∪
+  预约各分量）上；不含预约时可证明块处理次数上界为 `E·(P+L) + n`
+  （E=边数，P=类型树路径数，L=loan 数，n=块数）。含预约时预算沿用
+  同一公式（L 计入预约数），但 must 分量按交集收缩、不在该证明内，
+  上界不再被证明（见「已知限制」）。`check` 对只读输入，失败不留部分变更。
 * 冲突在不动点上做一次有序终扫描权威收集，故结果与 worklist 调度次序无关。
 
 ## 输入上限（接口边界）
@@ -105,6 +131,8 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
 * 块数：**1..50**；单块操作数：≤ 10 000；
 * 记录树节点总数：≤ 100 000；
 * 路径段、变量名、loan_id：非空字符串；每个 loan_id 仅一个 borrow 点；
+* reserve_id 同样是非空字符串、仅一个 reserve 点；`activate`/
+  `end_reserve` 必须引用已存在的 reserve_id（否则构造期报错）；
 * 后继下标必须在范围内、不可重复；`entry` 必须合法。
 
 ## 错误语义
@@ -116,9 +144,9 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   （`True` 不会被当作 1）、拒绝非整数与越界值。
 * 辅助 `finite_number(name, value)` 拒绝 `bool`、`NaN`、`±Infinity` 与非数值；
   `checked_int(name, value, min_value=...)` 拒绝 `bool`/浮点（含 NaN/Infinity）。
-* **预算耗尽 ≠ 证明无解/无冲突**：默认预算是上述可证明上界，合法输入
-  不会耗尽；显式传入更小的 `max_iterations` 时抛 `BudgetExhaustedError`，
-  与 `clean=True` 是两条严格分开的路径。
+* **预算耗尽 ≠ 证明无解/无冲突**：默认预算是上述上界（不含预约时可证明，
+  合法输入不会耗尽）；显式传入更小的 `max_iterations` 时抛
+  `BudgetExhaustedError`，与 `clean=True` 是两条严格分开的路径。
 
 ### 浮点与误差口径
 
@@ -138,6 +166,10 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   被测核心**，与核心的反链不动点是两条独立实现路线；两者的冲突集合
   `(kind, block, op)` 必须逐例一致。
 * `tests/test_validation.py`：非法输入定位、数值守卫、预算/无冲突分离。
+* `tests/test_reserve.py`：预约式借用验收——读取参数后激活（合法）、
+  激活前保留共享借用（拒绝）、预约后冲突可变借用、跨分支 must 放行/
+  拒绝、重复激活、父字段与子字段重叠、带循环的预算分离与校验异常，
+  期望值按题面契约手写。
 
 ## 设计取舍
 
@@ -150,6 +182,9 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   已移动”的边界。
 * 冲突检测是健全性报告：即使操作本身已构成冲突，其声明的状态效果仍按
   语义应用（如 reinit 仍恢复字段），使后续冲突能被完整枚举，不做首错即停。
+* 预约的存活性用 must（交集）而冲突报告用 may（并集）：激活/结束是
+  “只能操作仍存活的那一次”的全路径断言；`activate` 因 must 不满足被
+  拒绝时不改变任何状态（全有或全无），与独立参考的逐路径解释保持一致。
 
 ## 已知限制（本题数学/协议子集，不宣称行业标准兼容）
 
@@ -160,6 +195,10 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
 * `end_loan` 是词法操作，不推断隐式结束点（NLL）。
 * may 分析会报告真实编译器可能接受的分支组合（例如互斥分支分别移动不同
   字段后按并集处理），这是题面指定并集语义的直接结果。
+* **含预约时迭代次数上界未被证明**：must 分量（交汇取交集）不在
+  `E·(P+L)+n` 的单调增长证明内。预算仍沿用该公式（L 计入预约数），
+  有限格上不动点必达，但理论上合法输入也可能耗尽预算——此时抛
+  `BudgetExhaustedError`（未证明状态），与 `clean=True` 严格分开。
 
 ## 文件
 
@@ -169,5 +208,6 @@ borrow_check/model.py      # 数据结构、dict->CFG 构造与结构校验
 borrow_check/validator.py  # 语义校验（含支配集不动点）
 borrow_check/analyzer.py   # 核心：反链+精确移动、worklist 不动点、见证
 demo.py                    # 固定输入演示
+demo_iteration.py          # 预约式借用（reserve/activate）固定输入演示
 tests/                     # 必要测试 + 独立参考实现
 ```

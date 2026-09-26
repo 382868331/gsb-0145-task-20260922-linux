@@ -48,26 +48,47 @@ def generate_cfg(rng):
                 return lid
         return None
 
+    reserve_pool = [f"R{k}" for k in range(6)]
+    used_reserves = []
+
+    def fresh_reserve():
+        for rid in reserve_pool:
+            if rid not in used_reserves:
+                used_reserves.append(rid)
+                return rid
+        return None
+
     for bi in range(n):
         for _ in range(rng.randint(0 if bi == 0 else 1, 4)):
             path = list(rng.choice(legal_paths))
             roll = rng.random()
-            if roll < 0.2:
+            if roll < 0.15:
                 blocks[bi].append({"op": "move", "path": path})
-            elif roll < 0.4:
+            elif roll < 0.3:
                 lid = fresh_loan()
                 if lid is not None:
                     blocks[bi].append(
                         {"op": "borrow_shared", "loan_id": lid, "path": path})
-            elif roll < 0.6:
+            elif roll < 0.45:
                 lid = fresh_loan()
                 if lid is not None:
                     blocks[bi].append(
                         {"op": "borrow_mut", "loan_id": lid, "path": path})
-            elif roll < 0.72 and used_loans:
+            elif roll < 0.55 and used_loans:
                 blocks[bi].append(
                     {"op": "end_loan", "loan_id": rng.choice(used_loans)})
-            elif roll < 0.9:
+            elif roll < 0.65:
+                rid = fresh_reserve()
+                if rid is not None:
+                    blocks[bi].append(
+                        {"op": "reserve", "reserve_id": rid, "path": path})
+            elif roll < 0.75 and used_reserves:
+                blocks[bi].append(
+                    {"op": "activate", "reserve_id": rng.choice(used_reserves)})
+            elif roll < 0.82 and used_reserves:
+                blocks[bi].append(
+                    {"op": "end_reserve", "reserve_id": rng.choice(used_reserves)})
+            elif roll < 0.92:
                 blocks[bi].append({"op": "read", "path": path})
             else:
                 blocks[bi].append({"op": "write", "path": path,

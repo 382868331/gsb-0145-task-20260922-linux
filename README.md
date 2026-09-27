@@ -14,10 +14,11 @@
 ## 准确命令
 
 ```bash
-# 必要测试（51 个用例，含 400 个随机 DAG 与独立参考的对照）
+# 必要测试（65 个用例，含 400 个随机 DAG 与独立参考的对照）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：一个 clean 的正常结果 + 实际触发的拒绝与异常边界
+# （含 infer_loan_ends 推断模式与显式模式的对照）
 python demo.py
 ```
 
@@ -71,8 +72,14 @@ from borrow_check import (
 ### check
 
 ```python
-result = check(cfg, *, max_iterations=None) -> CheckResult
+result = check(cfg, *, max_iterations=None, infer_loan_ends=False) -> CheckResult
 ```
+
+* `infer_loan_ends=False`（默认）：原始显式语义，借用只在 `end_loan`
+  处结束。
+* `infer_loan_ends=True`：可选的**按使用位置推断借用结束点**（见下节），
+  后面不会再被读取的借用允许提前结束；`end_loan` 显式结束在两种
+  模式下都有效。非 bool 值抛 `TypeError`。
 
 * `result.clean: bool` —— 无冲突（“证明无冲突”路径）。
 * `result.conflicts: list[Conflict]`，按 `(块, 操作)` 有序；每个
@@ -86,6 +93,26 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   `read_while_mut_borrowed`、`write_while_borrowed`。
 * `result.iterations` 为到达不动点前的块处理次数。
 * `result.explain()` 渲染人类可读的冲突来源链（demo 使用）。
+
+## 可选：按使用位置推断借用结束点（infer_loan_ends=True）
+
+类 NLL 的两阶段分析，调用方按 `check` 的关键字参数选择是否采用：
+
+1. **反向 may-liveness 预分析**：loan L 在程序点活跃，当且仅当存在一条
+   从该点出发、不经过 `end_loan(L)` 与 L 的 borrow 点的路径，到达一个
+   读取与 L 区域**重叠**路径的 `read`（读取即“使用”；写/移动/再借用
+   不算使用，这样原对象才能在借用结束后恢复这些操作）。该预分析在
+   loan 幂集格上单调迭代到**不动点**，含循环回边只使用收敛后的结论，
+   不会误用上一轮的中间值；在某条后续路径上还会被读取的借用，在该
+   路径上保持活跃，不会提前结束。
+2. **前向主分析按点清理**：执行每个操作之前，把该点已不活跃的 loan
+   从活跃集合移除（kill 集合只依赖预分析结果，不依赖入口状态，因此
+   单调性与 `E·(P+L)+n` 的可证明步数上界保持不变；liveness 预分析
+   本身有独立的有限终止性，不占用 `max_iterations` 预算）。
+
+效果：`borrow_mut(a.x)` 之后若 `a.x` 不再被读取，则写/移动/再借用
+`a.x` 合法；若之后（含循环另一轮、汇合块之后）还会读取，则冲突照常
+报告。`end_loan` 的显式结束语义完全保留，可与推断混用。
 
 ## 算法
 
@@ -157,7 +184,9 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   无闭包/函数间分析、无解构模式、无投影外的别名模型；路径就是记录树
   上的字段投影，不模拟原始指针/索引/数组元素。
 * 块是扁平操作序列，不建模表达式树；一次操作只作用于一个固定路径。
-* `end_loan` 是词法操作，不推断隐式结束点（NLL）。
+* 默认语义下 `end_loan` 是词法操作，不推断隐式结束点；推断结束点
+  （上节）是可选模式，且以“读取重叠区域”作为借用的使用近似——本模块
+  没有引用变量，无法精确区分“通过引用访问”与“直接访问原对象”。
 * may 分析会报告真实编译器可能接受的分支组合（例如互斥分支分别移动不同
   字段后按并集处理），这是题面指定并集语义的直接结果。
 

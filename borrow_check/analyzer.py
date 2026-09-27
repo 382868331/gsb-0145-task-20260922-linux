@@ -19,6 +19,22 @@
 因此在有限格上 worklist 迭代必达不动点，且不靠遍历深度截断。块处理次数
 有可证明上界 ``E*(P+L) + n``（E 边数、P 类型树路径数、L loan 数、n 块数），
 预算耗尽与“分析完成且无冲突”严格区分。
+
+可选的借用结束点推断（``check(..., infer_loan_ends=True)``）：
+
+* 先做一遍**反向 may-liveness 预分析**：loan L 在程序点 p 活跃，当且仅当
+  存在一条从 p 出发、不经过 ``end_loan(L)`` 与 L 的 borrow 点（循环重入时
+  的重新借用会覆盖旧实例）的路径，到达一个**读取**与 L 区域重叠路径的
+  ``read`` 操作。该预分析同样在有限格上单调迭代到不动点，因此循环回边
+  使用的是收敛后的结论，不会误用上一轮（未收敛）的中间值。
+* 前向主分析中，在执行每个操作之前，就把在该点已经不活跃的 loan 从
+  活跃集合中移除（kill 集合只依赖预分析结果，不依赖入口状态，单调性
+  与可证明步数上界保持不变）。于是“后面不会再用”的借用提前结束，
+  原对象可以恢复写/移动/再借用等操作；而在某条后续路径上仍会被读取的
+  借用保持活跃，冲突照常报告。
+* ``end_loan`` 的显式结束语义完全保留：显式结束点在 liveness 中是 kill
+  点，两种模式可以混用；默认 ``infer_loan_ends=False`` 时行为与原版
+  完全一致。
 """
 
 from __future__ import annotations
@@ -210,12 +226,16 @@ class _Transfer:
         types: Dict[str, RecordNode],
         loan_info: Dict[str, _LoanInfo],
         collect: bool,
+        liveness: Optional[Dict[int, List[Tuple[int, frozenset]]]] = None,
     ) -> None:
         self.cfg = cfg
         self.types = types
         self.loan_info = loan_info
         self.collect = collect
         self.conflicts: List[Conflict] = []
+        # block_idx -> [(起始 op 下标, 该段内每个 op 执行前的活跃 loan 集合)]，
+        # 末尾带 (len(ops), live_out) 哨兵段，用于块末清理。
+        self.liveness = liveness
 
     # -- 见证辅助 ----------------------------------------------------------
 
@@ -336,8 +356,22 @@ class _Transfer:
     def run_block(self, block_idx: int, in_state: _State) -> _State:
         st = in_state.copy()
         block = self.cfg.blocks[block_idx]
+        segs = self.liveness.get(block_idx) if self.liveness is not None else None
+        seg_pos = 0
         for oi, op in enumerate(block.ops):
+            if segs is not None:
+                while seg_pos + 1 < len(segs) and segs[seg_pos + 1][0] <= oi:
+                    seg_pos += 1
+                live_before = segs[seg_pos][1]
+                for lid in list(st.loans):
+                    if lid not in live_before:
+                        del st.loans[lid]
             self._step(st, block_idx, oi, op)
+        if segs is not None:
+            live_out = segs[-1][1]  # 哨兵段：块出口处仍活跃的 loan
+            for lid in list(st.loans):
+                if lid not in live_out:
+                    del st.loans[lid]
         return st
 
     def _step(self, st: _State, bi: int, oi: int, op: Operation) -> None:
@@ -461,7 +495,87 @@ def _join(into: _State, other: _State) -> bool:
 # --------------------------------------------------------------------------
 
 
-def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
+def _backward_step(op: Operation, live: frozenset,
+                   loan_info: Dict[str, _LoanInfo]) -> frozenset:
+    """liveness 的单个操作反向传输（在 live-after 基础上得到 live-before）。
+
+    * ``read(p)``：所有区域与 p 重叠的 loan 被“使用”，进入活跃集合；
+    * ``end_loan(L)`` 与 L 的 borrow 点：L 在此之前不可能活跃（显式结束 /
+      循环重入的重新借用都会覆盖旧实例），从活跃集合移除。
+    """
+    if isinstance(op, Read):
+        grown = set(live)
+        for lid, info in loan_info.items():
+            if _overlaps(info.path, op.path):
+                grown.add(lid)
+        return frozenset(grown)
+    if isinstance(op, EndLoan):
+        if op.loan_id in live:
+            return frozenset(l for l in live if l != op.loan_id)
+        return live
+    if isinstance(op, (BorrowShared, BorrowMut)):
+        if op.loan_id in live:
+            return frozenset(l for l in live if l != op.loan_id)
+        return live
+    return live
+
+
+def _compute_loan_liveness(
+    cfg: CFG,
+    loan_info: Dict[str, _LoanInfo],
+    predecessors: Dict[int, List[int]],
+) -> Dict[int, List[Tuple[int, frozenset]]]:
+    """反向 may-liveness 不动点：推断每个 loan 在块内每个操作后的活跃集合。
+
+    返回 block_idx -> [(起始 op 下标, frozenset(loan_id))] 的升序段表：
+    段 (s, S) 表示对 op 下标 oi ∈ [s, 下一段起始)，执行 ops[oi] **之前**
+    活跃的 loan 集合为 S；每块末尾另有哨兵段 (len(ops), live_out)，
+    表示块出口处仍活跃的 loan。覆盖所有块（含空块）。
+
+    反向 worklist 在有限格（loan 集合的幂集）上单调迭代到不动点，含环
+    CFG 必终止；循环回边使用的是收敛后的结果。
+    """
+    n = len(cfg.blocks)
+    live_in: List[frozenset] = [frozenset() for _ in range(n)]
+    live_out: List[frozenset] = [frozenset() for _ in range(n)]
+
+    worklist: deque[int] = deque(range(n))
+    in_ws: set[int] = set(range(n))
+    while worklist:
+        bi = worklist.popleft()
+        in_ws.discard(bi)
+        live = live_out[bi]
+        for op in reversed(cfg.blocks[bi].ops):
+            live = _backward_step(op, live, loan_info)
+        if live != live_in[bi]:
+            live_in[bi] = live
+            for p in predecessors[bi]:
+                new_out = live_out[p] | live
+                if new_out != live_out[p]:
+                    live_out[p] = new_out
+                    if p not in in_ws:
+                        worklist.append(p)
+                        in_ws.add(p)
+
+    segments: Dict[int, List[Tuple[int, frozenset]]] = {}
+    for bi, block in enumerate(cfg.blocks):
+        raw: List[Tuple[int, frozenset]] = []
+        live = live_out[bi]
+        for oi in range(len(block.ops) - 1, -1, -1):
+            live = _backward_step(block.ops[oi], live, loan_info)
+            raw.append((oi, live))
+        raw.reverse()
+        raw.append((len(block.ops), live_out[bi]))  # 哨兵：块出口
+        segs = [raw[0]] if raw else []
+        for oi, s in raw[1:]:
+            if s != segs[-1][1]:
+                segs.append((oi, s))
+        segments[bi] = segs
+    return segments
+
+
+def check(cfg: CFG, *, max_iterations: Optional[int] = None,
+          infer_loan_ends: bool = False) -> CheckResult:
     """对 CFG 运行字段敏感静态借用检查。
 
     :param cfg: 已通过结构构造的 :class:`CFG`（``check`` 会先做完整语义校验）。
@@ -469,8 +583,13 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
         ``n * (P + L) + n``（n 块数、P 类型树路径数、L loan 数），
         合法 CFG 不可能耗尽。传入更小的正数可在测试中演示
         :class:`BudgetExhaustedError` 与“无冲突”结论的区别。
+    :param infer_loan_ends: 为 ``True`` 时启用按使用位置推断借用结束点
+        （反向 may-liveness 预分析 + 前向分析按点移除不活跃 loan），
+        后面不会再被读取的借用允许提前结束；``end_loan`` 显式结束
+        在两种模式下都有效。默认 ``False``，行为与原版完全一致。
     :raises CFGValidationError: 非法输入（携带 location）。
     :raises BudgetExhaustedError: 搜索预算耗尽。
+    :raises TypeError: ``infer_loan_ends`` 不是 bool。
     """
     from .validator import validate_cfg
     from .errors import checked_int
@@ -479,6 +598,9 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
 
     if max_iterations is not None:
         checked_int("max_iterations", max_iterations, min_value=1)
+    if not isinstance(infer_loan_ends, bool):
+        raise TypeError(
+            f"'infer_loan_ends' 必须是 bool，得到 {type(infer_loan_ends).__name__}")
 
     n = len(cfg.blocks)
     types: Dict[str, RecordNode] = {}
@@ -508,6 +630,11 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
     for preds in predecessors.values():
         preds.sort()
 
+    liveness = (
+        _compute_loan_liveness(cfg, loan_info, predecessors)
+        if infer_loan_ends else None
+    )
+
     # 记录每块抽象入口状态与每块出口的语义外延（用于单调变更判定）。
     ins: List[_State] = [_State() for _ in range(n)]
     outs: Dict[int, _State] = {}
@@ -526,7 +653,7 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
             if p in outs:
                 _join(merged, _lift(outs[p], idx))
         ins[idx] = merged
-        transfer = _Transfer(cfg, types, loan_info, collect=False)
+        transfer = _Transfer(cfg, types, loan_info, collect=False, liveness=liveness)
         new_out = transfer.run_block(idx, merged)
         new_denot = _denotation(new_out, universe)
         changed = idx not in out_denot or out_denot[idx] != new_denot
@@ -550,7 +677,7 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
     # 不动点已到：用最终入口状态做一次有序扫描，权威地收集冲突与见证。
     conflicts: List[Conflict] = []
     for bi in range(n):
-        transfer = _Transfer(cfg, types, loan_info, collect=True)
+        transfer = _Transfer(cfg, types, loan_info, collect=True, liveness=liveness)
         transfer.run_block(bi, ins[bi])
         conflicts.extend(transfer.conflicts)
 

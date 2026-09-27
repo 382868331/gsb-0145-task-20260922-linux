@@ -6,6 +6,8 @@
 1. 正常结果：互不相交字段的独立借用，经分支/循环后干净通过；
 2. 实际拒绝：循环中未结束的借用，打印带前驱传播链的冲突来源；
 3. 异常边界：可定位的非法输入错误，以及“预算耗尽 != 证明无冲突”。
+4. 可选的借用结束点推断（infer_loan_ends=True）：同一 CFG 在显式
+   语义下冲突、在推断语义下干净，且循环中仍被使用的借用照常拒绝。
 
 运行：python demo.py（约毫秒级，远小于 8 秒）。
 """
@@ -109,6 +111,57 @@ def main() -> None:
     assert w.origin_block == rejected.conflicts[0].block and w.origin_op > 0
     print("\n说明：借用诞生于 blocks[1].ops[1]，晚于同块读取 ops[0]；")
     print("      它只能沿 blocks[1] -> blocks[1] 回边传播，在第二轮进入时触发。")
+
+    # ------------------------------------------------------------------
+    # 2b) 可选推断：后面不会再用的借用按使用位置提前结束。
+    # ------------------------------------------------------------------
+    hr("2b) 可选推断：infer_loan_ends=True 按使用位置结束借用")
+    # 块0 共享借用 doc.text 后进入分支：块1 读 doc.text（共享借用允许读），
+    # 块2 写 doc.text——显式语义下借用仍活跃故冲突；推断语义下块2/块3
+    # 任何后续路径都不再读 doc.text，借用提前结束，写合法。
+    # 块3 自循环只写 doc.meta，验证回边不误用旧结论。
+    infer_cfg = cfg_from_dict({
+        "blocks": [
+            {"ops": [
+                {"op": "declare", "var": "doc", "ty": {"text": None, "meta": None}},
+                {"op": "borrow_shared", "loan_id": "L_doc", "path": ["doc", "text"]},
+            ]},
+            {"ops": [{"op": "read", "path": ["doc", "text"]}]},
+            {"ops": [
+                {"op": "write", "path": ["doc", "meta"]},
+                {"op": "write", "path": ["doc", "text"]},
+            ]},
+            {"ops": [{"op": "write", "path": ["doc", "meta"]}]},
+        ],
+        "successors": [[1, 2], [3], [3], [2, 3]],
+        "entry": 0,
+    })
+    explicit = check(infer_cfg)
+    inferred = check(infer_cfg, infer_loan_ends=True)
+    print(f"显式语义（默认）：clean={explicit.clean}，冲突="
+          f"{[(c.kind, c.block, c.op) for c in explicit.conflicts]}")
+    print(f"推断语义：clean={inferred.clean}"
+          f"（块2/块3 不再读 doc.text，L_doc 在那些路径上提前结束）")
+    assert not explicit.clean
+    assert inferred.clean, inferred.explain()
+
+    # 同一推断模式下，循环中仍被读取的借用不能提前结束：照常拒绝。
+    still_used = cfg_from_dict({
+        "blocks": [
+            {"ops": [
+                {"op": "declare", "var": "doc", "ty": {"text": None}},
+                {"op": "borrow_mut", "loan_id": "L_doc", "path": ["doc", "text"]},
+            ]},
+            {"ops": [{"op": "write", "path": ["doc", "text"]}]},
+            {"ops": [{"op": "read", "path": ["doc", "text"]}]},
+        ],
+        "successors": [[1], [1, 2], []],
+        "entry": 0,
+    })
+    still = check(still_used, infer_loan_ends=True)
+    print(f"对照：循环外仍会读取 doc.text 时，推断语义仍拒绝，冲突="
+          f"{[(c.kind, c.block, c.op) for c in still.conflicts]}")
+    assert not still.clean
 
     # ------------------------------------------------------------------
     # 3) 异常边界。

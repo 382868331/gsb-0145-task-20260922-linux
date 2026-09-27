@@ -72,6 +72,16 @@ class EndLoan:
 
 
 @dataclass(frozen=True)
+class UseLoan:
+    """use_loan：引用 loan_id 的一次实际使用点。
+
+    该操作只服务于可选的非词法借用结束推断；默认词法模式下无需使用。
+    """
+
+    loan_id: str
+
+
+@dataclass(frozen=True)
 class Read:
     """read：读取路径。路径不得可能已移动，且不得与活跃可变借用冲突。"""
 
@@ -91,7 +101,7 @@ class Write:
     reinit: bool = False
 
 
-Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write]
+Operation = Union[Decl, Move, BorrowShared, BorrowMut, EndLoan, UseLoan, Read, Write]
 
 _OP_KINDS = {
     "declare": Decl,
@@ -99,6 +109,7 @@ _OP_KINDS = {
     "borrow_shared": BorrowShared,
     "borrow_mut": BorrowMut,
     "end_loan": EndLoan,
+    "use_loan": UseLoan,
     "read": Read,
     "write": Write,
 }
@@ -202,6 +213,12 @@ def operation_from_dict(data: object, loc: str) -> Operation:
             if not _is_ident(loan_id):
                 raise CFGValidationError("loan_id 必须是非空字符串", f"{loc}.loan_id")
             return EndLoan(loan_id=loan_id)
+        if kind == "use_loan":
+            _require_keys(data, frozenset({"op", "loan_id"}), loc)
+            loan_id = data.get("loan_id")
+            if not _is_ident(loan_id):
+                raise CFGValidationError("loan_id 必须是非空字符串", f"{loc}.loan_id")
+            return UseLoan(loan_id=loan_id)
         # write
         _require_keys(data, frozenset({"op", "path", "reinit"}), loc)
         path = _validate_path(data.get("path"), f"{loc}.path")

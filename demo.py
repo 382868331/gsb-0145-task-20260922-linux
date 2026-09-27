@@ -111,6 +111,44 @@ def main() -> None:
     print("      它只能沿 blocks[1] -> blocks[1] 回边传播，在第二轮进入时触发。")
 
     # ------------------------------------------------------------------
+    # 2b) 可选 NLL：按 use_loan 实际使用点推断结束；默认仍保持词法语义。
+    # ------------------------------------------------------------------
+    hr("2b) 可选结束点推断：最后使用后恢复物主操作")
+    nll_linear = cfg_from_dict({
+        "blocks": [{"ops": [
+            {"op": "declare", "var": "v", "ty": None},
+            {"op": "borrow_mut", "loan_id": "r", "path": ["v"]},
+            {"op": "use_loan", "loan_id": "r"},
+            {"op": "write", "path": ["v"]},
+        ]}],
+        "successors": [[]],
+    })
+    lexical = check(nll_linear)
+    inferred = check(nll_linear, infer_loan_end=True)
+    print("直线程序默认词法模式 clean =", lexical.clean)
+    print("直线程序推断模式 clean =", inferred.clean, "（r 最后使用后已结束）")
+    assert not lexical.clean
+    assert inferred.clean
+
+    nll_loop = cfg_from_dict({
+        "blocks": [
+            {"ops": [
+                {"op": "declare", "var": "w", "ty": None},
+                {"op": "borrow_mut", "loan_id": "q", "path": ["w"]},
+            ]},
+            {"ops": [
+                {"op": "use_loan", "loan_id": "q"},
+                {"op": "write", "path": ["w"]},
+            ]},
+        ],
+        "successors": [[1], [1]],
+    })
+    loop_inferred = check(nll_loop, infer_loan_end=True)
+    print("循环中后续轮次还会 use_loan(q)，推断模式 clean =", loop_inferred.clean)
+    assert not loop_inferred.clean
+    assert loop_inferred.conflicts[0].kind == "write_while_borrowed"
+
+    # ------------------------------------------------------------------
     # 3) 异常边界。
     # ------------------------------------------------------------------
     hr("3a) 异常边界：非法输入给出可定位错误（不静默纠正）")

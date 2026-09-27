@@ -2,9 +2,9 @@
 
 公开接口：
 
-* 数据结构：:class:`CFG`、:class:`Block` 及七种操作
+* 数据结构：:class:`CFG`、:class:`Block` 及操作
   (:class:`Decl` :class:`Move` :class:`BorrowShared` :class:`BorrowMut`
-  :class:`EndLoan` :class:`Read` :class:`Write`)。
+  :class:`EndLoan` :class:`UseLoan` :class:`Read` :class:`Write`)。
 * 构造与校验：:func:`cfg_from_dict`、:func:`validate_cfg`。
 * 分析：:func:`check`，返回 :class:`CheckResult`（含 :class:`Conflict`
   与前驱见证 :class:`Witness`）。
@@ -31,6 +31,7 @@ from .model import (
     Operation,
     Path,
     Read,
+    UseLoan,
     Write,
     cfg_from_dict,
     operation_from_dict,
@@ -56,6 +57,7 @@ __all__ = [
     "Operation",
     "Path",
     "Read",
+    "UseLoan",
     "Write",
     "cfg_from_dict",
     "operation_from_dict",

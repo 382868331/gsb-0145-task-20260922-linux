@@ -39,6 +39,7 @@ from .model import (
     Path,
     Read,
     RecordNode,
+    UseLoan,
     Write,
 )
 
@@ -210,12 +211,23 @@ class _Transfer:
         types: Dict[str, RecordNode],
         loan_info: Dict[str, _LoanInfo],
         collect: bool,
+        live_before: Optional[List[List[set[str]]]] = None,
+        live_after: Optional[List[List[set[str]]]] = None,
     ) -> None:
         self.cfg = cfg
         self.types = types
         self.loan_info = loan_info
         self.collect = collect
         self.conflicts: List[Conflict] = []
+        self.live_before = live_before
+        self.live_after = live_after
+
+    def _restrict_live(self, st: _State, bi: int, oi: int, *, after: bool) -> None:
+        if self.live_before is None or self.live_after is None:
+            return
+        live = self.live_after[bi][oi] if after else self.live_before[bi][oi]
+        for lid in [x for x in st.loans if x not in live]:
+            del st.loans[lid]
 
     # -- 见证辅助 ----------------------------------------------------------
 
@@ -337,11 +349,16 @@ class _Transfer:
         st = in_state.copy()
         block = self.cfg.blocks[block_idx]
         for oi, op in enumerate(block.ops):
+            self._restrict_live(st, block_idx, oi, after=False)
             self._step(st, block_idx, oi, op)
+            self._restrict_live(st, block_idx, oi, after=True)
         return st
 
     def _step(self, st: _State, bi: int, oi: int, op: Operation) -> None:
         if isinstance(op, Decl):
+            return
+
+        if isinstance(op, UseLoan):
             return
 
         if isinstance(op, Move):
@@ -456,12 +473,60 @@ def _join(into: _State, other: _State) -> bool:
     return grown
 
 
+def _loan_liveness(cfg: CFG) -> tuple[list[set[str]], list[list[set[str]]], list[list[set[str]]]]:
+    """计算每个引用使用点之前/之后的 loan 活跃集合。
+
+    这是标准反向活跃性分析：``use_loan`` 产生活跃性，borrow 与显式
+    ``end_loan`` 终止活跃性。块出口取所有后继入口的并集，因此只有能沿某条
+    CFG 路径到达后续使用点的借用才会保持活跃；循环中的使用会通过不动点
+    传播到回边入口，不会错误复用上一轮直线扫描的结论。
+    """
+    n = len(cfg.blocks)
+    live_in: list[set[str]] = [set() for _ in range(n)]
+    live_before: list[list[set[str]]] = [
+        [set() for _ in block.ops] for block in cfg.blocks
+    ]
+    live_after: list[list[set[str]]] = [
+        [set() for _ in block.ops] for block in cfg.blocks
+    ]
+
+    changed = True
+    while changed:
+        changed = False
+        for bi in range(n - 1, -1, -1):
+            live: set[str] = set()
+            for succ in cfg.successors[bi]:
+                live.update(live_in[succ])
+
+            before = live_before[bi]
+            after = live_after[bi]
+            for oi in range(len(cfg.blocks[bi].ops) - 1, -1, -1):
+                after[oi] = set(live)
+                op = cfg.blocks[bi].ops[oi]
+                if isinstance(op, UseLoan):
+                    live.add(op.loan_id)
+                elif isinstance(op, EndLoan) or isinstance(op, (BorrowShared, BorrowMut)):
+                    live.discard(op.loan_id)
+                before[oi] = set(live)
+
+            if live != live_in[bi]:
+                changed = True
+                live_in[bi] = live
+
+    return live_in, live_before, live_after
+
+
 # --------------------------------------------------------------------------
 # 公开入口
 # --------------------------------------------------------------------------
 
 
-def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
+def check(
+    cfg: CFG,
+    *,
+    max_iterations: Optional[int] = None,
+    infer_loan_end: bool = False,
+) -> CheckResult:
     """对 CFG 运行字段敏感静态借用检查。
 
     :param cfg: 已通过结构构造的 :class:`CFG`（``check`` 会先做完整语义校验）。
@@ -471,11 +536,18 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
         :class:`BudgetExhaustedError` 与“无冲突”结论的区别。
     :raises CFGValidationError: 非法输入（携带 location）。
     :raises BudgetExhaustedError: 搜索预算耗尽。
+    :param infer_loan_end: 为 ``False``（默认）时保留原词法语义：借用直到
+        ``end_loan`` 才结束。为 ``True`` 时额外启用按 ``use_loan`` 实际使用
+        点推断结束；没有后续使用路径的借用会在当前操作后结束，显式
+        ``end_loan`` 仍可提前终止。
     """
     from .validator import validate_cfg
     from .errors import checked_int
 
     validate_cfg(cfg)
+
+    if not isinstance(infer_loan_end, bool):
+        raise TypeError("infer_loan_end 必须是布尔值")
 
     if max_iterations is not None:
         checked_int("max_iterations", max_iterations, min_value=1)
@@ -493,6 +565,9 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
 
     p_count = len(all_type_paths(types))
     l_count = len(loan_info)
+    live_in, live_before, live_after = (
+        _loan_liveness(cfg) if infer_loan_end else (None, None, None)
+    )
     universe = all_type_paths(types)
     edge_count = sum(len(s) for s in cfg.successors)
     # 单调 worklist 的可证步数上界：每块出口外延至多严格增长 P+L 次；
@@ -524,9 +599,15 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
         merged = _State()
         for p in predecessors[idx]:
             if p in outs:
-                _join(merged, _lift(outs[p], idx))
+                lifted = _lift(outs[p], idx)
+                if live_in is not None:
+                    for lid in [x for x in lifted.loans if x not in live_in[idx]]:
+                        del lifted.loans[lid]
+                _join(merged, lifted)
         ins[idx] = merged
-        transfer = _Transfer(cfg, types, loan_info, collect=False)
+        transfer = _Transfer(
+            cfg, types, loan_info, collect=False,
+            live_before=live_before, live_after=live_after)
         new_out = transfer.run_block(idx, merged)
         new_denot = _denotation(new_out, universe)
         changed = idx not in out_denot or out_denot[idx] != new_denot
@@ -550,7 +631,9 @@ def check(cfg: CFG, *, max_iterations: Optional[int] = None) -> CheckResult:
     # 不动点已到：用最终入口状态做一次有序扫描，权威地收集冲突与见证。
     conflicts: List[Conflict] = []
     for bi in range(n):
-        transfer = _Transfer(cfg, types, loan_info, collect=True)
+        transfer = _Transfer(
+            cfg, types, loan_info, collect=True,
+            live_before=live_before, live_after=live_after)
         transfer.run_block(bi, ins[bi])
         conflicts.extend(transfer.conflicts)
 

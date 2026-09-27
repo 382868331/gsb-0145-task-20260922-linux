@@ -24,6 +24,7 @@ from .model import (
     Decl,
     EndLoan,
     Move,
+    UseLoan,
     Operation,
     Path,
     Read,
@@ -120,7 +121,7 @@ def validate_cfg(cfg: CFG) -> None:
                 loan_site[op.loan_id] = op
                 _check_path_shape(op.path, f"{oloc}.path")
                 op_path_users.append((bi, oi, op, op.path))
-            elif isinstance(op, EndLoan):
+            elif isinstance(op, (EndLoan, UseLoan)):
                 if not isinstance(op.loan_id, str) or op.loan_id == "":
                     raise CFGValidationError("loan_id 必须是非空字符串", f"{oloc}.loan_id")
             else:  # pragma: no cover - 防御性分支
@@ -134,9 +135,9 @@ def validate_cfg(cfg: CFG) -> None:
     # end_loan 引用的 loan 必须存在。
     for bi, block in enumerate(blocks):
         for oi, op in enumerate(block.ops):
-            if isinstance(op, EndLoan) and op.loan_id not in loan_site:
+            if isinstance(op, (EndLoan, UseLoan)) and op.loan_id not in loan_site:
                 raise CFGValidationError(
-                    f"end_loan 引用了不存在的 loan_id {op.loan_id!r}",
+                    f"{op.__class__.__name__.lower()} 引用了不存在的 loan_id {op.loan_id!r}",
                     f"blocks[{bi}].ops[{oi}].loan_id",
                 )
 

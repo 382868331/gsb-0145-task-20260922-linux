@@ -14,7 +14,7 @@
 ## 准确命令
 
 ```bash
-# 必要测试（51 个用例，含 400 个随机 DAG 与独立参考的对照）
+# 必要测试（57 个用例，含 400 个随机 DAG 与独立参考的对照）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：一个 clean 的正常结果 + 实际触发的拒绝与异常边界
@@ -28,7 +28,7 @@ demo 实测耗时约 1 毫秒（不使用 sleep、不使用预录结果，全部
 ```python
 from borrow_check import (
     CFG, Block,                       # 图
-    Decl, Move, BorrowShared, BorrowMut, EndLoan, Read, Write,  # 七种操作
+    Decl, Move, BorrowShared, BorrowMut, EndLoan, UseLoan, Read, Write,
     cfg_from_dict, validate_cfg, check,
     CheckResult, Conflict, Witness,  # 结果
     CFGValidationError, BudgetExhaustedError,
@@ -52,7 +52,8 @@ from borrow_check import (
 | `move(path)` | 移动路径；若该路径可能已移动或与活跃借用重叠则冲突 |
 | `borrow_shared(loan_id, path)` | 开共享借用；与路径重叠的活跃 **mut** 借用冲突，多个 shared 可共存 |
 | `borrow_mut(loan_id, path)` | 开可变借用；与路径重叠的**任何**活跃借用冲突 |
-| `end_loan(loan_id)` | 结束借用；loan_id 必须存在 |
+| `end_loan(loan_id)` | 显式结束借用；loan_id 必须存在 |
+| `use_loan(loan_id)` | 引用的一次实际使用点；仅在启用结束点推断时影响活跃性 |
 | `read(path)` | 路径不得可能已移动；不得有重叠的活跃可变借用（共享借用允许读） |
 | `write(path, reinit=False)` | 普通写不得与任何活跃借用重叠、路径不得可能已移动；`reinit=True` 为字段重组写 |
 
@@ -71,7 +72,7 @@ from borrow_check import (
 ### check
 
 ```python
-result = check(cfg, *, max_iterations=None) -> CheckResult
+result = check(cfg, *, max_iterations=None, infer_loan_end=False) -> CheckResult
 ```
 
 * `result.clean: bool` —— 无冲突（“证明无冲突”路径）。
@@ -86,6 +87,17 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   `read_while_mut_borrowed`、`write_while_borrowed`。
 * `result.iterations` 为到达不动点前的块处理次数。
 * `result.explain()` 渲染人类可读的冲突来源链（demo 使用）。
+* `infer_loan_end=False`（默认）保留原词法语义：借用持续到显式
+  `end_loan`。设为 `True` 时，只把能沿某条 CFG 路径到达后续 `use_loan`
+  的借用视为活跃；显式 `end_loan` 仍可提前结束。
+
+```python
+# r 在最后一次 use_loan 后不再活跃，随后 write(v) 不会被拒绝。
+borrow_mut("r", ("v",))
+use_loan("r")
+write(("v",))
+check(cfg, infer_loan_end=True)
+```
 
 ## 算法
 
@@ -93,8 +105,11 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   * 可能已移动路径：**子树移动反链**（`move` 产生，压自身及子孙）+
     **精确移动集合**（只压自身，reinit 拆分祖先移动时产生）；
   * 可能仍活跃借用：`loan_id` 集合（may：分支并集，故包含“可能未结束”）。
-* 分支合并 = 两者并集；worklist 单调迭代到**不动点**（循环求不动点），
-  对任意含环 CFG 都终止，终止性不依赖递归深度或截断。
+* 分支合并 = 两者并集；启用推断时先做标准反向活跃性不动点，并在每条
+  CFG 边上只传播目标块入口仍会使用的 loan。因此某分支最后使用后可结束，
+  另一分支若还会使用则仍保持活跃；循环中的使用会传播到回边入口。
+* worklist 单调迭代到**不动点**（循环求不动点），对任意含环 CFG 都终止，
+  终止性不依赖递归深度或截断。
 * 变更判定建立在状态的**语义外延**（被压制路径集合 ∪ 活跃 loan）上；
   可证明块处理次数上界为 `E·(P+L) + n`（E=边数，P=类型树路径数，
   L=loan 数，n=块数）。`check` 对只读输入，失败不留部分变更。
@@ -138,6 +153,8 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
   被测核心**，与核心的反链不动点是两条独立实现路线；两者的冲突集合
   `(kind, block, op)` 必须逐例一致。
 * `tests/test_validation.py`：非法输入定位、数值守卫、预算/无冲突分离。
+* `tests/test_inferred_loan_end.py`：直线程序最后使用点、分支边过滤、
+  循环回边与显式结束兼容。
 
 ## 设计取舍
 
@@ -153,11 +170,12 @@ result = check(cfg, *, max_iterations=None) -> CheckResult
 
 ## 已知限制（本题数学/协议子集，不宣称行业标准兼容）
 
-* 不是完整 Rust 借用检查器：无生命周期推断、无 NLL/place 上下文、
+* 不是完整 Rust 借用检查器：无生命周期参数推断、无完整 NLL/place 上下文、
   无闭包/函数间分析、无解构模式、无投影外的别名模型；路径就是记录树
   上的字段投影，不模拟原始指针/索引/数组元素。
 * 块是扁平操作序列，不建模表达式树；一次操作只作用于一个固定路径。
-* `end_loan` 是词法操作，不推断隐式结束点（NLL）。
+* 默认模式中 `end_loan` 是词法操作；`infer_loan_end=True` 只按显式给出的
+  `use_loan` 程序点做引用活跃性，不猜测普通 `read/write` 中哪一个经由引用访问。
 * may 分析会报告真实编译器可能接受的分支组合（例如互斥分支分别移动不同
   字段后按并集处理），这是题面指定并集语义的直接结果。
 
